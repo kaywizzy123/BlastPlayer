@@ -1,5 +1,5 @@
 """
-BlastPlayer — player_window.py  (v3, RV-style)
+BlastPlayer — player_window.py  (v4, FFmpeg backend)
 
 Layout
 ------
@@ -13,17 +13,21 @@ Layout
               ├── info row  "N frames"  |  FRAME#  |  fps
               ├── scrubber  (full width)
               └── transport row  [tools]  [nav]  [volume]
+
+FFmpeg backend notes
+--------------------
+  • ffprobe  — metadata (fps, dimensions, frame count)
+  • ffmpeg pipe — sequential frame decode during playback (_open_pipe)
+  • ffmpeg single-frame — accurate seek for stepping/scrubbing (_fetch_frame)
+  • ffplay   — audio (unchanged from v3)
+
+No OpenCV dependency.
 """
 
 import sys
+import json
 import subprocess
 from pathlib import Path
-
-try:
-    import cv2
-    _CV2_AVAILABLE = True
-except ImportError:
-    _CV2_AVAILABLE = False
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QStackedWidget,
@@ -39,7 +43,7 @@ from PyQt5.QtGui import QImage, QPixmap, QFont, QDragEnterEvent, QDropEvent, QIc
 from core import constants
 
 
-# ── helper ────────────────────────────────────────────────────────────────── #
+# ── helpers ───────────────────────────────────────────────────────────────── #
 
 def _icon(name: str) -> QIcon:
     p = constants.ICONS_DIR / name
@@ -72,6 +76,84 @@ def _nav_btn(text: str = "", icon_name: str = "",
         QPushButton:pressed {{ background: {constants.ACCENT_HI}; color: white; }}
     """)
     return btn
+
+
+def _ffmpeg_exe() -> str:
+    exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    candidate = Path(constants.FFMPEG_PATH).parent / exe
+    return str(candidate) if candidate.exists() else exe   # fall back to $PATH
+
+
+def _ffprobe_exe() -> str:
+    exe = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
+    candidate = Path(constants.FFMPEG_PATH).parent / exe
+    return str(candidate) if candidate.exists() else exe
+
+
+def _ffplay_exe() -> str:
+    exe = "ffplay.exe" if sys.platform == "win32" else "ffplay"
+    candidate = Path(constants.FFMPEG_PATH).parent / exe
+    return str(candidate) if candidate.exists() else exe
+
+
+# ── ffprobe metadata ──────────────────────────────────────────────────────── #
+
+def probe_video(path: str) -> dict:
+    """
+    Returns a dict with keys:
+        fps          (float)
+        total_frames (int)
+        width        (int)
+        height       (int)
+    Raises RuntimeError if ffprobe fails or the file has no video stream.
+    """
+    cmd = [
+        _ffprobe_exe(),
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        "-select_streams", "v:0",
+        path,
+    ]
+    try:
+        raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise RuntimeError(f"ffprobe failed: {exc}") from exc
+
+    data = json.loads(raw)
+    streams = data.get("streams", [])
+    if not streams:
+        raise RuntimeError("No video stream found.")
+    s = streams[0]
+
+    # fps
+    def _ratio(field: str) -> float:
+        val = s.get(field, "0/1")
+        parts = val.split("/")
+        if len(parts) == 2 and int(parts[1]):
+            return int(parts[0]) / int(parts[1])
+        return float(parts[0])
+
+    fps = _ratio("r_frame_rate") or _ratio("avg_frame_rate") or 24.0
+
+    # frame count  (nb_frames is absent in some containers)
+    if "nb_frames" in s and s["nb_frames"].isdigit():
+        total_frames = int(s["nb_frames"])
+    elif "duration" in s:
+        total_frames = max(1, int(float(s["duration"]) * fps))
+    elif "tags" in s and "DURATION" in s["tags"]:
+        h, m, sec = s["tags"]["DURATION"].split(":")
+        dur = int(h) * 3600 + int(m) * 60 + float(sec)
+        total_frames = max(1, int(dur * fps))
+    else:
+        total_frames = 0   # unknown — scrubber will show 0
+
+    return {
+        "fps":          fps,
+        "total_frames": total_frames,
+        "width":        int(s.get("width", 0)),
+        "height":       int(s.get("height", 0)),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -124,8 +206,8 @@ class WelcomeWidget(QWidget):
 class VideoCanvas(QWidget):
     """Pure black canvas — video QLabel fills it, wheel/drag signals for zoom & pan."""
 
-    zoom_scrolled = pyqtSignal(int)      # +1 = in, -1 = out
-    pan_dragged   = pyqtSignal(int, int) # dx, dy
+    zoom_scrolled = pyqtSignal(int)       # +1 = in, -1 = out
+    pan_dragged   = pyqtSignal(int, int)  # dx, dy
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -178,7 +260,18 @@ class VideoCanvas(QWidget):
 
 class PlayerWidget(QWidget):
     """
-    Frame-accurate player.
+    Frame-accurate player backed by FFmpeg pipes.
+
+    Playback strategy
+    -----------------
+      Forward play  : persistent ffmpeg pipe opened at the seek point;
+                      _on_tick reads one frame (width*height*3 bytes) per tick.
+                      Seeking re-opens the pipe at the new position.
+      Reverse play  : no pipe — _on_tick calls _fetch_frame(n-1) each tick
+                      (single-frame accurate seek).  Acceptable because reverse
+                      is inherently slow; a frame cache could be added later.
+      Step / scrub  : _fetch_frame() — single ffmpeg invocation, post-input -ss
+                      for frame-accurate positioning.
 
     Shortcuts:  Space/K  play-pause   L  play-fwd   J  play-bwd
                 ←/→  step frame       Home/End  first/last
@@ -187,41 +280,50 @@ class PlayerWidget(QWidget):
     _SPEEDS       = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
     _SPEED_LABELS = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
 
-    # emitted so the window can update its title
-    frame_changed = None   # set up in __init__
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, True)
 
+        # File / probe info
         self._path            = ""
-        self._cap             = None
         self._fps             = 24.0
         self._total_frames    = 0
+        self._vid_w           = 0
+        self._vid_h           = 0        # native dimensions (pre-transform)
+
+        # Playback state
         self._current_frame   = 0
         self._is_playing      = False
         self._play_reverse    = False
         self._speed           = 1.0
+        self._loop            = False
+
+        # Pipe (forward playback)
+        self._pipe_proc       = None     # subprocess.Popen | None
+        self._pipe_frame      = 0        # frame index pipe is currently at
+
+        # Audio
         self._volume          = 100
         self._audio_proc      = None
-        self._scrubber_moving      = False
-        self._loop                 = False
-        self._current_pixmap       = None
-        self._audio_scrub_enabled  = False
-        self._scrub_proc           = None
-        self._loop_on_step         = False
-        self._loop_on_scrub        = False
+        self._audio_scrub_enabled = False
+        self._scrub_proc      = None
 
-        # Debounce timer for scrub audio (fires 80 ms after last scrub move)
+        # Scrub debounce
         self._scrub_debounce = QTimer(self)
         self._scrub_debounce.setSingleShot(True)
         self._scrub_debounce.timeout.connect(self._play_scrub_audio)
 
+        # Misc state
+        self._scrubber_moving = False
+        self._current_pixmap  = None
+        self._loop_on_step    = False
+        self._loop_on_scrub   = False
+
         # Transform state
-        self._zoom     = 1.0   # 1.0 = fit; > 1.0 = zoomed in
+        self._zoom     = 1.0
         self._pan_x    = 0
         self._pan_y    = 0
-        self._rotation = 0     # 0 | 90 | 180 | 270
+        self._rotation = 0      # 0 | 90 | 180 | 270
         self._flip_h   = False
         self._flip_v   = False
 
@@ -236,14 +338,17 @@ class PlayerWidget(QWidget):
 
     def load_video(self, path: str) -> bool:
         self._cleanup()
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
+        try:
+            info = probe_video(path)
+        except RuntimeError as exc:
+            print(f"[BlastPlayer] probe: {exc}")
             return False
 
-        self._path          = path
-        self._cap           = cap
-        self._fps           = cap.get(cv2.CAP_PROP_FPS) or 24.0
-        self._total_frames  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._path         = path
+        self._fps          = info["fps"]
+        self._total_frames = info["total_frames"]
+        self._vid_w        = info["width"]
+        self._vid_h        = info["height"]
         self._current_frame = 0
 
         self._scrubber.blockSignals(True)
@@ -261,6 +366,115 @@ class PlayerWidget(QWidget):
         self._cleanup()
 
     # ------------------------------------------------------------------ #
+    #  FFmpeg frame helpers                                                #
+    # ------------------------------------------------------------------ #
+
+    def _effective_size(self) -> tuple[int, int]:
+        """Return (w, h) after applying current rotation."""
+        if self._rotation in (90, 270):
+            return self._vid_h, self._vid_w
+        return self._vid_w, self._vid_h
+
+    def _build_vf(self) -> str:
+        """Build a libavfilter -vf string for the current flip/rotation."""
+        filters = []
+        if self._flip_h:
+            filters.append("hflip")
+        if self._flip_v:
+            filters.append("vflip")
+        if self._rotation == 90:
+            filters.append("transpose=1")
+        elif self._rotation == 180:
+            filters.append("transpose=1,transpose=1")
+        elif self._rotation == 270:
+            filters.append("transpose=2")
+        return ",".join(filters) if filters else "null"
+
+    def _fetch_frame(self, frame_num: int) -> bytes | None:
+        """
+        Accurate single-frame decode via ffmpeg (post-input -ss).
+        Returns raw RGB24 bytes or None on failure.
+        Uses post-input seek so every frame is reachable, not just keyframes.
+        This is slower than the pipe but only used for stepping/scrubbing/reverse.
+        """
+        if not self._path or not self._vid_w:
+            return None
+        seek = frame_num / self._fps
+        w, h = self._effective_size()
+        cmd = [
+            _ffmpeg_exe(),
+            "-i",        self._path,
+            "-ss",       f"{seek:.6f}",
+            "-frames:v", "1",
+            "-f",        "rawvideo",
+            "-pix_fmt",  "rgb24",
+            "-vf",       self._build_vf(),
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            raw = proc.stdout
+            expected = w * h * 3
+            return raw if len(raw) == expected else None
+        except Exception as exc:
+            print(f"[BlastPlayer] fetch_frame: {exc}")
+            return None
+
+    # ── Pipe (forward playback) ──────────────────────────────────────── #
+
+    def _open_pipe(self, start_frame: int = 0):
+        """Open a persistent ffmpeg pipe starting at start_frame."""
+        self._close_pipe()
+        if not self._path or not self._vid_w:
+            return
+        # Pre-input -ss for fast keyframe seek, then let ffmpeg decode forward.
+        # Small inaccuracy at the start is acceptable during continuous playback.
+        seek = start_frame / self._fps
+        cmd = [
+            _ffmpeg_exe(),
+            "-ss",      f"{seek:.6f}",
+            "-i",       self._path,
+            "-f",       "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-vf",      self._build_vf(),
+            "pipe:1",
+        ]
+        try:
+            self._pipe_proc  = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            self._pipe_frame = start_frame
+        except Exception as exc:
+            print(f"[BlastPlayer] pipe open: {exc}")
+            self._pipe_proc = None
+
+    def _close_pipe(self):
+        if self._pipe_proc is not None:
+            try:
+                self._pipe_proc.stdout.close()
+                self._pipe_proc.terminate()
+                self._pipe_proc.wait(timeout=1)
+            except Exception:
+                pass
+            self._pipe_proc = None
+
+    def _read_pipe_frame(self) -> bytes | None:
+        """Read one frame from the open pipe. Returns None on EOF/error."""
+        if self._pipe_proc is None:
+            return None
+        w, h = self._effective_size()
+        nbytes = w * h * 3
+        try:
+            raw = self._pipe_proc.stdout.read(nbytes)
+        except Exception:
+            return None
+        return raw if len(raw) == nbytes else None
+
+    # ------------------------------------------------------------------ #
     #  UI                                                                  #
     # ------------------------------------------------------------------ #
 
@@ -275,9 +489,7 @@ class PlayerWidget(QWidget):
         self._canvas.pan_dragged.connect(self._on_pan_drag)
         root.addWidget(self._canvas, stretch=1)
 
-        # ── Timeline strip (own widget, black background) ─────────────────
-        # Row 1: frame number centred above scrubber
-        # Row 2: [N frames]  [── scrubber ──]  [fps]
+        # ── Timeline strip ────────────────────────────────────────────────
         timeline = QWidget()
         timeline.setFixedHeight(42)
         timeline.setStyleSheet("background: black;")
@@ -285,7 +497,6 @@ class PlayerWidget(QWidget):
         tl.setContentsMargins(0, 2, 0, 2)
         tl.setSpacing(0)
 
-        # Frame number row (centred)
         fn_row = QHBoxLayout()
         fn_row.setContentsMargins(0, 0, 0, 0)
         fn_row.addStretch()
@@ -301,7 +512,6 @@ class PlayerWidget(QWidget):
         fn_row.addStretch()
         tl.addLayout(fn_row)
 
-        # Scrubber row: [N frames] [slider] [fps]
         sc_row = QHBoxLayout()
         sc_row.setContentsMargins(10, 0, 10, 0)
         sc_row.setSpacing(8)
@@ -338,18 +548,14 @@ class PlayerWidget(QWidget):
         tr.setContentsMargins(8, 0, 8, 0)
         tr.setSpacing(2)
 
-        # ── Left side (stretch=1) keeps nav centred ──────────────────────
         tr.addStretch(1)
 
-        # ── Nav buttons — centred:  ⏮  ◀  J  ▶  ▶  ⏭  ↺ ──────────────
-        self._first_btn = _nav_btn("",  "backward.png",              tooltip="First frame  (Home)",  w=28, h=28)
-        self._prev_btn  = _nav_btn("",  "left-arrow.png",            tooltip="Step back  (←)",       w=28, h=28)
-        self._back_btn  = _nav_btn("",  "left.png",                  tooltip="Play backward  (J)",   w=28, h=28)
-
-        self._play_btn  = _nav_btn("",  "play-button-arrowhead.png", tooltip="Play / Pause  (Space)",w=42, h=32)
-
-        self._next_btn  = _nav_btn("",  "right-arrow (2).png",       tooltip="Step forward  (→)",    w=28, h=28)
-        self._last_btn  = _nav_btn("",  "skip-button.png",           tooltip="Last frame  (End)",    w=28, h=28)
+        self._first_btn = _nav_btn("", "backward.png",              tooltip="First frame  (Home)", w=28, h=28)
+        self._prev_btn  = _nav_btn("", "left-arrow.png",            tooltip="Step back  (←)",      w=28, h=28)
+        self._back_btn  = _nav_btn("", "left.png",                  tooltip="Play backward  (J)",  w=28, h=28)
+        self._play_btn  = _nav_btn("", "play-button-arrowhead.png", tooltip="Play / Pause  (Space)", w=42, h=32)
+        self._next_btn  = _nav_btn("", "right-arrow (2).png",       tooltip="Step forward  (→)",   w=28, h=28)
+        self._last_btn  = _nav_btn("", "skip-button.png",           tooltip="Last frame  (End)",   w=28, h=28)
 
         self._loop_btn = QPushButton()
         self._loop_btn.setIcon(_icon("loop.png"))
@@ -379,7 +585,7 @@ class PlayerWidget(QWidget):
             if btn is self._play_btn:
                 tr.addSpacing(6)
 
-        # ── Right side (stretch=1) — speed + volume, right-aligned ───────
+        # Right side: speed + volume
         right = QWidget()
         right.setStyleSheet("background: transparent;")
         right_layout = QHBoxLayout(right)
@@ -387,7 +593,6 @@ class PlayerWidget(QWidget):
         right_layout.setSpacing(6)
         right_layout.addStretch()
 
-        # Speed combo
         self._speed_combo = QComboBox()
         self._speed_combo.addItems(self._SPEED_LABELS)
         self._speed_combo.setCurrentIndex(3)
@@ -411,7 +616,6 @@ class PlayerWidget(QWidget):
         self._speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         right_layout.addWidget(self._speed_combo)
 
-        # Volume
         vol_ic = _nav_btn("", "volume-up.png", tooltip="Volume", w=24, h=28)
         right_layout.addWidget(vol_ic)
 
@@ -433,10 +637,9 @@ class PlayerWidget(QWidget):
         right_layout.addWidget(self._vol_lbl)
 
         tr.addWidget(right, stretch=1)
-
         root.addWidget(transport)
 
-        # ── Wire buttons ──────────────────────────────────────────────────
+        # Wire buttons
         self._first_btn.clicked.connect(self._go_first)
         self._prev_btn.clicked.connect(self._step_back)
         self._back_btn.clicked.connect(self._play_backward)
@@ -458,57 +661,68 @@ class PlayerWidget(QWidget):
             self._play(reverse=True)
 
     def _play(self, reverse: bool = False):
-        if not self._cap:
+        if not self._path:
             return
         if not reverse and self._current_frame >= self._total_frames - 1:
-            self._seek(0)
+            self._seek_no_render(0)
         if reverse and self._current_frame <= 0:
-            self._seek(self._total_frames - 1)
+            self._seek_no_render(self._total_frames - 1)
+
         self._is_playing   = True
         self._play_reverse = reverse
         self._play_btn.setIcon(_icon("pause.png"))
         self._play_btn.setText("")
-        self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
+
+        if not reverse:
+            self._open_pipe(self._current_frame)
+
+        interval = max(1, int(1000 / (self._fps * self._speed)))
+        self._timer.start(interval)
         self._start_audio()
 
     def _pause(self):
         self._is_playing   = False
         self._play_reverse = False
         self._timer.stop()
+        self._close_pipe()
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._stop_audio()
 
     def _on_tick(self):
-        if not self._cap:
+        if not self._path:
             return
+
         if self._play_reverse:
+            # Accurate single-frame reverse
             if self._current_frame <= 0:
                 if self._loop:
-                    self._seek(self._total_frames - 1)
+                    self._seek_no_render(self._total_frames - 1)
                     self._start_audio()
                 else:
                     self._pause()
                 return
             target = self._current_frame - 1
-            self._cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-            ret, frame = self._cap.read()
-            if not ret:
+            raw = self._fetch_frame(target)
+            if raw is None:
                 self._pause()
                 return
             self._current_frame = target
-            self._render(frame)
+            self._render_raw(raw)
         else:
-            ret, frame = self._cap.read()
-            if not ret:
+            # Read next frame from the pipe
+            raw = self._read_pipe_frame()
+            if raw is None:
                 if self._loop:
-                    self._seek(0)
+                    self._seek_no_render(0)
+                    self._open_pipe(0)
                     self._start_audio()
                     return
                 self._pause()
                 return
-            self._current_frame = int(self._cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-            self._render(frame)
+            self._render_raw(raw)
+            self._current_frame = self._pipe_frame
+            self._pipe_frame   += 1
 
         if not self._scrubber_moving:
             self._scrubber.blockSignals(True)
@@ -522,7 +736,7 @@ class PlayerWidget(QWidget):
 
     def _step_forward(self):
         self._pause()
-        if not self._cap:
+        if not self._path:
             return
         if self._current_frame < self._total_frames - 1:
             self._seek(self._current_frame + 1)
@@ -531,7 +745,7 @@ class PlayerWidget(QWidget):
 
     def _step_back(self):
         self._pause()
-        if not self._cap:
+        if not self._path:
             return
         if self._current_frame > 0:
             self._seek(self._current_frame - 1)
@@ -540,57 +754,45 @@ class PlayerWidget(QWidget):
 
     def _go_first(self):
         self._pause()
-        if self._cap:
+        if self._path:
             self._seek(0)
 
     def _go_last(self):
         self._pause()
-        if self._cap:
+        if self._path:
             self._seek(self._total_frames - 1)
 
     def _seek(self, frame_num: int):
-        if not self._cap:
+        """Accurate seek + display update."""
+        if not self._path:
             return
         frame_num = max(0, min(frame_num, self._total_frames - 1))
         self._current_frame = frame_num
-        self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
         self._show_frame(frame_num)
         self._scrubber.blockSignals(True)
         self._scrubber.setValue(frame_num)
         self._scrubber.blockSignals(False)
         self._update_info()
 
+    def _seek_no_render(self, frame_num: int):
+        """Set current_frame without fetching (used before opening a pipe)."""
+        self._current_frame = max(0, min(frame_num, self._total_frames - 1))
+
     def _show_frame(self, frame_num: int):
-        if not self._cap:
-            return
-        self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-        ret, frame = self._cap.read()
-        if ret:
-            self._render(frame)
+        raw = self._fetch_frame(frame_num)
+        if raw:
+            self._render_raw(raw)
 
     # ------------------------------------------------------------------ #
     #  Rendering                                                           #
     # ------------------------------------------------------------------ #
 
-    def _render(self, frame):
-        # Apply flip
-        if self._flip_h and self._flip_v:
-            frame = cv2.flip(frame, -1)
-        elif self._flip_h:
-            frame = cv2.flip(frame, 1)
-        elif self._flip_v:
-            frame = cv2.flip(frame, 0)
-        # Apply rotation
-        if self._rotation == 90:
-            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        elif self._rotation == 180:
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
-        elif self._rotation == 270:
-            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+    def _render_raw(self, raw: bytes):
+        """Convert raw RGB24 bytes to QPixmap and display."""
+        w, h = self._effective_size()
+        if w == 0 or h == 0:
+            return
+        qimg = QImage(raw, w, h, w * 3, QImage.Format_RGB888)
         self._current_pixmap = QPixmap.fromImage(qimg)
         self._refresh_display()
 
@@ -615,13 +817,11 @@ class PlayerWidget(QWidget):
             scaled_full = self._current_pixmap.scaled(
                 pw, ph, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
             )
-            # Clamp pan so we never go out of bounds
             self._pan_x = max(0, min(self._pan_x, max(0, pw - dw)))
             self._pan_y = max(0, min(self._pan_y, max(0, ph - dh)))
             vw = min(dw, pw)
             vh = min(dh, ph)
             crop = scaled_full.copy(QRect(self._pan_x, self._pan_y, vw, vh))
-            # Centre the crop on black if smaller than display
             if vw < dw or vh < dh:
                 canvas = QPixmap(dw, dh)
                 canvas.fill(Qt.black)
@@ -644,24 +844,24 @@ class PlayerWidget(QWidget):
         self._scrubber_moving = True
         if self._is_playing:
             self._timer.stop()
+            self._close_pipe()
             self._stop_audio()
 
     def _on_scrubber_released(self):
         self._scrubber_moving = False
         self._current_frame   = self._scrubber.value()
-        if self._cap:
-            self._cap.set(cv2.CAP_PROP_POS_FRAMES, self._current_frame)
         if self._is_playing:
+            if not self._play_reverse:
+                self._open_pipe(self._current_frame)
             self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
             self._start_audio()
 
     def _on_scrubber_moved(self, value: int):
-        if not self._cap:
+        if not self._path:
             return
-        self._cap.set(cv2.CAP_PROP_POS_FRAMES, value)
-        ret, frame = self._cap.read()
-        if ret:
-            self._render(frame)
+        raw = self._fetch_frame(value)
+        if raw:
+            self._render_raw(raw)
             self._current_frame = value
         self._update_info()
         if self._audio_scrub_enabled:
@@ -684,20 +884,16 @@ class PlayerWidget(QWidget):
     #  Audio                                                               #
     # ------------------------------------------------------------------ #
 
-    def _ffplay(self) -> str:
-        exe = "ffplay.exe" if sys.platform == "win32" else "ffplay"
-        return str(Path(constants.FFMPEG_PATH).parent / exe)
-
     def _start_audio(self):
         self._stop_audio()
-        ffplay = self._ffplay()
+        ffplay = _ffplay_exe()
         if not Path(ffplay).exists():
             return
         seek = self._current_frame / self._fps
         try:
             self._audio_proc = subprocess.Popen(
                 [ffplay, "-nodisp", "-autoexit",
-                 "-ss", f"{seek:.4f}",
+                 "-ss",     f"{seek:.4f}",
                  "-volume", str(self._volume),
                  self._path],
                 stdout=subprocess.DEVNULL,
@@ -712,21 +908,20 @@ class PlayerWidget(QWidget):
         self._audio_proc = None
 
     def _play_scrub_audio(self):
-        """Play a short audio snippet at the current frame for scrub feedback."""
-        if not self._path or not self._cap:
+        """Short audio snippet at current frame for scrub feedback."""
+        if not self._path:
             return
-        ffplay = self._ffplay()
+        ffplay = _ffplay_exe()
         if not Path(ffplay).exists():
             return
-        # Kill previous scrub snippet
         if self._scrub_proc and self._scrub_proc.poll() is None:
             self._scrub_proc.terminate()
         seek = self._current_frame / self._fps
         try:
             self._scrub_proc = subprocess.Popen(
                 [ffplay, "-nodisp", "-autoexit",
-                 "-ss", f"{seek:.4f}",
-                 "-t", "0.15",
+                 "-ss",     f"{seek:.4f}",
+                 "-t",      "0.15",
                  "-volume", str(self._volume),
                  self._path],
                 stdout=subprocess.DEVNULL,
@@ -743,7 +938,7 @@ class PlayerWidget(QWidget):
             self._start_audio()
 
     # ------------------------------------------------------------------ #
-    #  Info update                                                         #
+    #  Info update / frame callback                                        #
     # ------------------------------------------------------------------ #
 
     def _update_info(self):
@@ -751,7 +946,6 @@ class PlayerWidget(QWidget):
         self._frame_num_lbl.setText(str(f))
         self._frames_lbl.setText(f"{self._total_frames} frames")
         self._fps_lbl.setText(f"{self._fps:.2f} fps")
-        # Notify window to update title
         if hasattr(self, '_on_frame_changed'):
             self._on_frame_changed(f)
 
@@ -781,10 +975,7 @@ class PlayerWidget(QWidget):
         self._refresh_display()
 
     def _on_zoom_scroll(self, direction: int):
-        if direction > 0:
-            self.zoom_in()
-        else:
-            self.zoom_out()
+        self.zoom_in() if direction > 0 else self.zoom_out()
 
     def _on_pan_drag(self, dx: int, dy: int):
         if self._zoom > 1.0:
@@ -813,10 +1004,14 @@ class PlayerWidget(QWidget):
         self._rerender()
 
     def _rerender(self):
-        """Re-apply transforms to the current frame without seeking."""
-        if self._cap and self._current_frame >= 0:
+        """
+        Re-fetch the current frame with updated -vf filters.
+        If playing forward, the pipe must be re-opened so the new vf takes effect.
+        """
+        if self._is_playing and not self._play_reverse:
+            self._open_pipe(self._current_frame)
+        elif self._path and self._current_frame >= 0:
             self._show_frame(self._current_frame)
-
 
     # ------------------------------------------------------------------ #
     #  Keyboard                                                            #
@@ -827,18 +1022,18 @@ class PlayerWidget(QWidget):
         mods = event.modifiers()
         ctrl = mods & Qt.ControlModifier
 
-        if   k == Qt.Key_Space:                       self._toggle_play()
-        elif k == Qt.Key_L:                           self._play(reverse=False)
-        elif k == Qt.Key_J:                           self._play(reverse=True)
-        elif k == Qt.Key_K:                           self._pause()
-        elif k == Qt.Key_Left  and not ctrl:          self._step_back()
-        elif k == Qt.Key_Right and not ctrl:          self._step_forward()
-        elif k == Qt.Key_Home:                        self._go_first()
-        elif k == Qt.Key_End:                         self._go_last()
-        elif k == Qt.Key_Equal and ctrl:              self.zoom_in()
-        elif k == Qt.Key_Minus and ctrl:              self.zoom_out()
-        elif k == Qt.Key_0     and ctrl:              self.zoom_reset()
-        elif k == Qt.Key_Backslash and not ctrl:      self.zoom_reset()
+        if   k == Qt.Key_Space:                  self._toggle_play()
+        elif k == Qt.Key_L:                      self._play(reverse=False)
+        elif k == Qt.Key_J:                      self._play(reverse=True)
+        elif k == Qt.Key_K:                      self._pause()
+        elif k == Qt.Key_Left  and not ctrl:     self._step_back()
+        elif k == Qt.Key_Right and not ctrl:     self._step_forward()
+        elif k == Qt.Key_Home:                   self._go_first()
+        elif k == Qt.Key_End:                    self._go_last()
+        elif k == Qt.Key_Equal and ctrl:         self.zoom_in()
+        elif k == Qt.Key_Minus and ctrl:         self.zoom_out()
+        elif k == Qt.Key_0     and ctrl:         self.zoom_reset()
+        elif k == Qt.Key_Backslash and not ctrl: self.zoom_reset()
         else: super().keyPressEvent(event)
 
     # ------------------------------------------------------------------ #
@@ -847,12 +1042,11 @@ class PlayerWidget(QWidget):
 
     def _cleanup(self):
         self._timer.stop()
+        self._close_pipe()
         self._stop_audio()
-        if self._cap:
-            self._cap.release()
-            self._cap = None
-        self._current_frame  = 0
-        self._is_playing     = False
+        self._path          = ""
+        self._current_frame = 0
+        self._is_playing    = False
         self._current_pixmap = None
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
@@ -940,7 +1134,8 @@ class BlastPlayerWindow(QMainWindow):
         fm = mb.addMenu("File")
         oa = fm.addAction("Open…"); oa.setShortcut("Ctrl+O"); oa.triggered.connect(self._on_open)
         fm.addSeparator()
-        qa = fm.addAction("Quit");  qa.setShortcut("Ctrl+Q"); qa.setMenuRole(QAction.QuitRole); qa.triggered.connect(self.close)
+        qa = fm.addAction("Quit"); qa.setShortcut("Ctrl+Q")
+        qa.setMenuRole(QAction.QuitRole); qa.triggered.connect(self.close)
 
         # Edit
         em = mb.addMenu("Edit")
@@ -956,60 +1151,67 @@ class BlastPlayerWindow(QMainWindow):
         for i, (spd, lbl) in enumerate(zip(PlayerWidget._SPEEDS, PlayerWidget._SPEED_LABELS)):
             a = sm.addAction(lbl); a.setCheckable(True); a.setChecked(spd == 1.0)
             sg.addAction(a)
-            _idx = i
-            a.triggered.connect(lambda _, _i=_idx: self._player._speed_combo.setCurrentIndex(_i))
+            a.triggered.connect(lambda _, _i=i: self._player._speed_combo.setCurrentIndex(_i))
         pb.addSeparator()
-        _a = pb.addAction("Play / Pause");   _a.setShortcut("Space"); _a.triggered.connect(self._player._toggle_play)
-        _b = pb.addAction("Play Forwards");  _b.setShortcut("L");     _b.triggered.connect(lambda: self._player._play(reverse=False))
-        _c = pb.addAction("Play Backwards"); _c.setShortcut("J");     _c.triggered.connect(lambda: self._player._play(reverse=True))
-        _d = pb.addAction("Pause");          _d.setShortcut("K");     _d.triggered.connect(self._player._pause)
+        pb.addAction("Play / Pause").setShortcut("Space")
+        pb.actions()[-1].triggered.connect(self._player._toggle_play)
+        pb.addAction("Play Forwards").setShortcut("L")
+        pb.actions()[-1].triggered.connect(lambda: self._player._play(reverse=False))
+        pb.addAction("Play Backwards").setShortcut("J")
+        pb.actions()[-1].triggered.connect(lambda: self._player._play(reverse=True))
+        pb.addAction("Pause").setShortcut("K")
+        pb.actions()[-1].triggered.connect(self._player._pause)
         pb.addSeparator()
-        _e = pb.addAction("Go to Start"); _e.setShortcut("Home"); _e.triggered.connect(self._player._go_first)
-        _f = pb.addAction("Go to End");   _f.setShortcut("End");  _f.triggered.connect(self._player._go_last)
+        pb.addAction("Go to Start").setShortcut("Home")
+        pb.actions()[-1].triggered.connect(self._player._go_first)
+        pb.addAction("Go to End").setShortcut("End")
+        pb.actions()[-1].triggered.connect(self._player._go_last)
         pb.addSeparator()
         la = pb.addAction("Loop"); la.setCheckable(True)
         la.triggered.connect(self._player._loop_btn.setChecked)
         pb.addSeparator()
-
         ss = pb.addMenu("Stepping and Scrubbing")
-        los = ss.addAction("Loop on Step");   los.setShortcut("Ctrl+Shift+."); los.setCheckable(True)
+        los = ss.addAction("Loop on Step"); los.setShortcut("Ctrl+Shift+."); los.setCheckable(True)
         los.triggered.connect(lambda c: setattr(self._player, "_loop_on_step", c))
-        loc = ss.addAction("Loop on Scrub");  loc.setShortcut("Ctrl+Alt+.");   loc.setCheckable(True)
+        loc = ss.addAction("Loop on Scrub"); loc.setShortcut("Ctrl+Alt+."); loc.setCheckable(True)
         loc.triggered.connect(lambda c: setattr(self._player, "_loop_on_scrub", c))
 
         # Audio
         am = mb.addMenu("Audio")
         am.addAction("Volume Up").triggered.connect(
-            lambda: self._player._vol_slider.setValue(min(100, self._player._vol_slider.value() + 5)))
+            lambda: self._player._vol_slider.setValue(
+                min(100, self._player._vol_slider.value() + 5)))
         am.addAction("Volume Down").triggered.connect(
-            lambda: self._player._vol_slider.setValue(max(0, self._player._vol_slider.value() - 5)))
+            lambda: self._player._vol_slider.setValue(
+                max(0, self._player._vol_slider.value() - 5)))
         am.addSeparator()
         scrub_act = am.addAction("Audio Scrubbing")
         scrub_act.setCheckable(True)
-        scrub_act.setChecked(False)
         scrub_act.triggered.connect(
-            lambda checked: setattr(self._player, "_audio_scrub_enabled", checked)
-        )
+            lambda checked: setattr(self._player, "_audio_scrub_enabled", checked))
 
         # Video
         vm = mb.addMenu("Video")
-
         fs_act = vm.addAction("Fullscreen"); fs_act.setShortcut("F11")
         fs_act.triggered.connect(self._toggle_fullscreen)
         vm.addSeparator()
-
-        pz_menu = vm.addMenu("Pan / Zoom")
-        _zi = pz_menu.addAction("Zoom In");       _zi.setShortcut("Ctrl+="); _zi.triggered.connect(self._player.zoom_in)
-        _zo = pz_menu.addAction("Zoom Out");      _zo.setShortcut("Ctrl+-"); _zo.triggered.connect(self._player.zoom_out)
-        _zr = pz_menu.addAction("Reset Pan/Zoom");_zr.setShortcut("Ctrl+0"); _zr.triggered.connect(self._player.zoom_reset)
+        pz = vm.addMenu("Pan / Zoom")
+        pz.addAction("Zoom In").setShortcut("Ctrl+=")
+        pz.actions()[-1].triggered.connect(self._player.zoom_in)
+        pz.addAction("Zoom Out").setShortcut("Ctrl+-")
+        pz.actions()[-1].triggered.connect(self._player.zoom_out)
+        pz.addAction("Reset Pan/Zoom").setShortcut("Ctrl+0")
+        pz.actions()[-1].triggered.connect(self._player.zoom_reset)
         vm.addSeparator()
-
-        _rcw = vm.addAction("Rotate CW");  _rcw.setShortcut("Ctrl+Shift+M"); _rcw.triggered.connect(self._player.rotate_cw)
-        _rcc = vm.addAction("Rotate CCW"); _rcc.setShortcut("Ctrl+Shift+N"); _rcc.triggered.connect(self._player.rotate_ccw)
+        vm.addAction("Rotate CW").setShortcut("Ctrl+Shift+M")
+        vm.actions()[-1].triggered.connect(self._player.rotate_cw)
+        vm.addAction("Rotate CCW").setShortcut("Ctrl+Shift+N")
+        vm.actions()[-1].triggered.connect(self._player.rotate_ccw)
         vm.addSeparator()
-
-        _fh = vm.addAction("Flip Horizontal"); _fh.setShortcut("Ctrl+X");       _fh.triggered.connect(self._player.flip_horizontal)
-        _fv = vm.addAction("Flip Vertical");   _fv.setShortcut("Ctrl+Shift+X"); _fv.triggered.connect(self._player.flip_vertical)
+        vm.addAction("Flip Horizontal").setShortcut("Ctrl+X")
+        vm.actions()[-1].triggered.connect(self._player.flip_horizontal)
+        vm.addAction("Flip Vertical").setShortcut("Ctrl+Shift+X")
+        vm.actions()[-1].triggered.connect(self._player.flip_vertical)
 
         # Bookmarks
         bm = mb.addMenu("Bookmarks")
@@ -1025,18 +1227,13 @@ class BlastPlayerWindow(QMainWindow):
         hm = mb.addMenu("Help")
         hm.addAction("Keyboard Shortcuts")
         hm.addSeparator()
-        about_act = hm.addAction("About BlastPlayer")
-        about_act.triggered.connect(self._on_about)
+        hm.addAction("About BlastPlayer").triggered.connect(self._on_about)
 
     # ------------------------------------------------------------------ #
     #  Open video                                                          #
     # ------------------------------------------------------------------ #
 
     def open_video(self, path: str):
-        if not _CV2_AVAILABLE:
-            QMessageBox.critical(self, "Missing dependency",
-                "opencv-python is required.\npip install opencv-python")
-            return
         if not self._player.load_video(path):
             QMessageBox.warning(self, "Cannot open", f"Could not open:\n{path}")
             return
@@ -1046,13 +1243,10 @@ class BlastPlayerWindow(QMainWindow):
         self._update_title(0)
 
     def _setup_shortcuts(self):
-        pass  # shortcuts handled via keyPressEvent + NoFocus on buttons
+        pass  # handled via keyPressEvent
 
     def _toggle_fullscreen(self):
-        if self.isFullScreen():
-            self.showNormal()
-        else:
-            self.showFullScreen()
+        self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_F11:
