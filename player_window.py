@@ -398,6 +398,13 @@ class PlayerWidget(QWidget):
         self._frame_cache   = None   # list[bytes] once ready, None while not cached
         self._cache_loading = False  # True while background decode is running
 
+        # Display-size QImage cache — frames pre-scaled in background, zero main-thread scaling
+        self._display_qimage_cache = None   # list[QImage] at display size
+        self._display_cache_size   = (0, 0) # (w, h) at which display cache was built
+
+        # Title update throttle
+        self._last_title_frame = -1
+
         # Reverse frame cache
         self._reverse_cache   = []      # list of (frame_num, raw_bytes), pop() = backward
         self._cache_building  = False   # True while background thread is filling cache
@@ -644,9 +651,39 @@ class PlayerWidget(QWidget):
 
             if frames:
                 self._frame_cache = frames
+                # Kick off display cache build on the main thread once layout is settled
+                QTimer.singleShot(0, self._start_display_cache_build)
             self._cache_loading = False
 
         threading.Thread(target=_fill, daemon=True).start()
+
+    def _start_display_cache_build(self):
+        """
+        Scale every cached raw frame to the current display size using
+        SmoothTransformation in a background thread (QImage is thread-safe).
+        During playback the main thread then only needs QPixmap.fromImage()
+        on an already-correct-size image — no per-frame scaling at all.
+        """
+        if not self._frame_cache:
+            return
+        disp = self._canvas.display()
+        dw, dh = disp.width(), disp.height()
+        if dw == 0 or dh == 0:
+            return
+        w, h       = self._effective_size()
+        raw_frames = self._frame_cache  # local ref — safe across threads
+
+        def _scale():
+            display_frames = []
+            for raw in raw_frames:
+                qimg   = QImage(raw, w, h, w * 3, QImage.Format_RGB888)
+                scaled = qimg.scaled(dw, dh, Qt.KeepAspectRatio,
+                                     Qt.SmoothTransformation)
+                display_frames.append(scaled)
+            self._display_qimage_cache = display_frames
+            self._display_cache_size   = (dw, dh)
+
+        threading.Thread(target=_scale, daemon=True).start()
 
     def _open_loop_pipe(self):
         """Pre-warm a pipe from frame 0 so the loop swap is instantaneous."""
@@ -1026,6 +1063,8 @@ class PlayerWidget(QWidget):
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._stop_audio()
+        # Re-render current frame at full SmoothTransformation quality now that we're paused
+        self._refresh_display()
 
     def _on_tick(self):
         if not self._path:
@@ -1068,14 +1107,26 @@ class PlayerWidget(QWidget):
 
             if self._frame_cache is not None:
                 # ── Cache mode ──────────────────────────────────────── #
+                disp      = self._canvas.display()
+                dw, dh    = disp.width(), disp.height()
+                use_dcache = (
+                    self._display_qimage_cache is not None
+                    and self._display_cache_size == (dw, dh)
+                    and self._zoom <= 1.0
+                )
+
                 if target_frame >= len(self._frame_cache):
                     if self._loop:
                         self._stop_audio()
                         self._play_frame_start = 0
                         self._play_clock_start = time.monotonic()
                         self._current_frame    = 0
-                        self._render_raw(self._frame_cache[0])
                         self._pipe_frame       = 1
+                        if use_dcache:
+                            disp.setPixmap(QPixmap.fromImage(
+                                self._display_qimage_cache[0]))
+                        else:
+                            self._render_raw(self._frame_cache[0])
                         self._start_audio()
                         self._scrubber.blockSignals(True)
                         self._scrubber.setValue(0)
@@ -1088,7 +1139,11 @@ class PlayerWidget(QWidget):
                 if target_frame <= self._current_frame:
                     return  # not yet time for the next frame
 
-                self._render_raw(self._frame_cache[target_frame])
+                if use_dcache:
+                    disp.setPixmap(QPixmap.fromImage(
+                        self._display_qimage_cache[target_frame]))
+                else:
+                    self._render_raw(self._frame_cache[target_frame])
                 self._current_frame = target_frame
                 self._pipe_frame    = target_frame + 1
 
@@ -1253,9 +1308,10 @@ class PlayerWidget(QWidget):
         if dw == 0 or dh == 0:
             return
 
+        transform = Qt.FastTransformation if self._is_playing else Qt.SmoothTransformation
         if self._zoom <= 1.0:
             scaled = self._current_pixmap.scaled(
-                disp.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                disp.size(), Qt.KeepAspectRatio, transform
             )
             self._pan_x = 0
             self._pan_y = 0
@@ -1264,7 +1320,7 @@ class PlayerWidget(QWidget):
             pw = int(self._current_pixmap.width()  * self._zoom)
             ph = int(self._current_pixmap.height() * self._zoom)
             scaled_full = self._current_pixmap.scaled(
-                pw, ph, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+                pw, ph, Qt.IgnoreAspectRatio, transform
             )
             self._pan_x = max(0, min(self._pan_x, max(0, pw - dw)))
             self._pan_y = max(0, min(self._pan_y, max(0, ph - dh)))
@@ -1283,6 +1339,13 @@ class PlayerWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        dw = self._canvas.display().width()
+        dh = self._canvas.display().height()
+        if (self._display_qimage_cache is not None
+                and self._display_cache_size != (dw, dh)):
+            self._display_qimage_cache = None
+            if self._frame_cache:
+                self._start_display_cache_build()
         self._refresh_display()
 
     # ------------------------------------------------------------------ #
@@ -1410,10 +1473,14 @@ class PlayerWidget(QWidget):
     def _update_info(self):
         f = self._current_frame
         self._frame_num_lbl.setText(str(f + 1))
-        self._frames_lbl.setText(f"{self._total_frames} frames")
-        self._fps_lbl.setText(f"{self._fps:.2f} fps")
+        if not self._is_playing:
+            self._frames_lbl.setText(f"{self._total_frames} frames")
+            self._fps_lbl.setText(f"{self._fps:.2f} fps")
         if hasattr(self, '_on_frame_changed'):
-            self._on_frame_changed(f + 1)
+            # Throttle setWindowTitle during playback — OS title changes are expensive
+            if not self._is_playing or (f - self._last_title_frame) >= 6:
+                self._on_frame_changed(f + 1)
+                self._last_title_frame = f
 
     def set_frame_callback(self, fn):
         self._on_frame_changed = fn
@@ -1477,8 +1544,10 @@ class PlayerWidget(QWidget):
         """
         self._close_lookahead()
         self._close_loop_pipe()
-        self._frame_cache   = None   # stale — wrong filters
-        self._cache_loading = False
+        self._frame_cache          = None
+        self._cache_loading        = False
+        self._display_qimage_cache = None
+        self._display_cache_size   = (0, 0)
         if self._is_playing and not self._play_reverse:
             self._open_pipe(self._current_frame)
         elif self._path and self._current_frame >= 0:
@@ -1525,10 +1594,13 @@ class PlayerWidget(QWidget):
         self._reverse_cache    = []
         self._cache_building   = False
         self._loop_frame0      = None
-        self._frame_cache      = None
-        self._cache_loading    = False
-        self._play_clock_start = 0.0
-        self._play_frame_start = 0
+        self._frame_cache          = None
+        self._cache_loading        = False
+        self._display_qimage_cache = None
+        self._display_cache_size   = (0, 0)
+        self._last_title_frame     = -1
+        self._play_clock_start     = 0.0
+        self._play_frame_start     = 0
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._canvas.display().clear()
