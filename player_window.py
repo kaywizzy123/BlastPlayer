@@ -1064,8 +1064,9 @@ class PlayerWidget(QWidget):
                 if pos >= len(self._frame_cache):
                     if self._loop:
                         self._stop_audio()
-                        self._pipe_frame    = 0
                         self._current_frame = 0
+                        self._render_raw(self._frame_cache[0])  # show frame 0 now, not next tick
+                        self._pipe_frame    = 1
                         self._start_audio()
                         self._scrubber.blockSignals(True)
                         self._scrubber.setValue(0)
