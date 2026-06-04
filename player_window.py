@@ -402,8 +402,6 @@ class PlayerWidget(QWidget):
         self._display_qimage_cache = None   # list[QImage] at display size
         self._display_cache_size   = (0, 0) # (w, h) at which display cache was built
 
-        # Title update throttle
-        self._last_title_frame = -1
 
         # Reverse frame cache
         self._reverse_cache   = []      # list of (frame_num, raw_bytes), pop() = backward
@@ -1473,14 +1471,10 @@ class PlayerWidget(QWidget):
     def _update_info(self):
         f = self._current_frame
         self._frame_num_lbl.setText(str(f + 1))
-        if not self._is_playing:
-            self._frames_lbl.setText(f"{self._total_frames} frames")
-            self._fps_lbl.setText(f"{self._fps:.2f} fps")
+        self._frames_lbl.setText(f"{self._total_frames} frames")
+        self._fps_lbl.setText(f"{self._fps:.2f} fps")
         if hasattr(self, '_on_frame_changed'):
-            # Throttle setWindowTitle during playback — OS title changes are expensive
-            if not self._is_playing or (f - self._last_title_frame) >= 6:
-                self._on_frame_changed(f + 1)
-                self._last_title_frame = f
+            self._on_frame_changed(f + 1)
 
     def set_frame_callback(self, fn):
         self._on_frame_changed = fn
@@ -1598,7 +1592,6 @@ class PlayerWidget(QWidget):
         self._cache_loading        = False
         self._display_qimage_cache = None
         self._display_cache_size   = (0, 0)
-        self._last_title_frame     = -1
         self._play_clock_start     = 0.0
         self._play_frame_start     = 0
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
