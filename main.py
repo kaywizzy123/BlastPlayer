@@ -26,7 +26,7 @@ def main():
     app.setApplicationName("BlastPlayer")
 
     window = BlastPlayerWindow()
-    window.showMaximized()
+    window.show()
 
     # Open a video passed via command line
     if len(sys.argv) > 1:

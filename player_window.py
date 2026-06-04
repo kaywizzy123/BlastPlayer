@@ -26,6 +26,8 @@ No OpenCV dependency.
 
 import sys
 import json
+import queue
+import threading
 import subprocess
 from pathlib import Path
 
@@ -36,9 +38,10 @@ from PyQt5.QtWidgets import (
     QAction, QFileDialog, QMessageBox,
     QFrame, QToolButton, QActionGroup, QComboBox, QShortcut,
 )
-from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QRect, QPoint
+from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QRect, QPoint, QSettings
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtGui import QImage, QPixmap, QFont, QDragEnterEvent, QDropEvent, QIcon, QPainter
+from PyQt5.QtWidgets import QStyle, QStyleOptionSlider
 
 from core import constants
 
@@ -200,6 +203,77 @@ class WelcomeWidget(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Scrubber slider — clicks jump to exact position
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ScrubberSlider(QSlider):
+    """
+    QSlider that jumps to the exact clicked position on the groove.
+
+    Qt's default behaviour moves by a page step when clicking the groove, and
+    calling super() afterwards overrides our setValue with that page step.
+    We intercept groove clicks entirely: bypass super() for press/move/release,
+    manually emit the standard signals, and let super() handle handle-drag as
+    normal so no existing behaviour is regressed.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._groove_pressed = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle_rect = self.style().subControlRect(
+                QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+            if not handle_rect.contains(event.pos()):
+                # Groove click: jump directly, don't let super() page-step on top.
+                self._groove_pressed = True
+                self.setValue(self._value_from_pos(event.pos()))
+                self.sliderPressed.emit()
+                event.accept()
+                return
+        self._groove_pressed = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._groove_pressed:
+            val = max(self.minimum(),
+                      min(self._value_from_pos(event.pos()), self.maximum()))
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._groove_pressed:
+            self._groove_pressed = False
+            self.sliderReleased.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _value_from_pos(self, pos) -> int:
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+        handle = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+        if self.orientation() == Qt.Horizontal:
+            span    = groove.width() - handle.width()
+            rel_pos = pos.x() - groove.x() - handle.width() // 2
+        else:
+            span    = groove.height() - handle.height()
+            rel_pos = pos.y() - groove.y() - handle.height() // 2
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), rel_pos, span,
+            self.invertedAppearance())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Video canvas
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -279,6 +353,7 @@ class PlayerWidget(QWidget):
 
     _SPEEDS       = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
     _SPEED_LABELS = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
+    _CACHE_MAX_MB = 2048   # skip RAM cache if decoded frames exceed this
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -301,6 +376,26 @@ class PlayerWidget(QWidget):
         # Pipe (forward playback)
         self._pipe_proc       = None     # subprocess.Popen | None
         self._pipe_frame      = 0        # frame index pipe is currently at
+        self._loop_frame0     = None     # raw bytes of frame 0, pre-decoded into memory
+
+        # Pipe reader thread — keeps pipe reads off the main thread
+        self._frame_queue   = queue.Queue(maxsize=4)
+        self._reader_thread = None
+        self._reader_stop   = threading.Event()
+
+        # Pre-warmed loop pipe — opened N frames before EOF for seamless looping
+        self._loop_pipe_proc   = None
+        self._loop_pipe_queue  = None
+        self._loop_pipe_thread = None
+        self._loop_reader_stop = threading.Event()
+
+        # RAM frame cache — all frames decoded into memory for zero-latency playback
+        self._frame_cache   = None   # list[bytes] once ready, None while not cached
+        self._cache_loading = False  # True while background decode is running
+
+        # Reverse frame cache
+        self._reverse_cache   = []      # list of (frame_num, raw_bytes), pop() = backward
+        self._cache_building  = False   # True while background thread is filling cache
 
         # Audio
         self._volume          = 100
@@ -360,6 +455,7 @@ class PlayerWidget(QWidget):
         self._play_btn.setText("")
         self._show_frame(0)
         self._update_info()
+        self._start_cache_build()
         return True
 
     def stop(self):
@@ -424,18 +520,36 @@ class PlayerWidget(QWidget):
 
     # ── Pipe (forward playback) ──────────────────────────────────────── #
 
+    _LOOKAHEAD_FRAMES    = 30    # open the loop-back pipe this many frames before the end
+    _AUDIO_SYNC_OFFSET   = 0.10  # seconds — shifts video clock forward to wait for ffplay startup
+
     def _open_pipe(self, start_frame: int = 0):
-        """Open a persistent ffmpeg pipe starting at start_frame."""
+        """
+        Open a persistent ffmpeg pipe starting at start_frame.
+
+        Uses a double-seek for accuracy:
+          1. Pre-input -ss snaps quickly to the nearest keyframe up to 4 s before.
+          2. Post-input -ss fine-seeks within the decoded stream to the exact frame.
+        This gives frame-accurate positioning without the cost of a full post-input
+        seek from the beginning.
+        """
         self._close_pipe()
+        self._close_loop_pipe()
+        self._close_lookahead()
         if not self._path or not self._vid_w:
             return
-        # Pre-input -ss for fast keyframe seek, then let ffmpeg decode forward.
-        # Small inaccuracy at the start is acceptable during continuous playback.
-        seek = start_frame / self._fps
-        cmd = [
-            _ffmpeg_exe(),
-            "-ss",      f"{seek:.6f}",
+
+        pre_offset_frames = min(start_frame, int(self._fps * 4))
+        pre_frame         = start_frame - pre_offset_frames
+        pre_ts            = pre_frame / self._fps
+        fine_ts           = pre_offset_frames / self._fps
+
+        cmd = [_ffmpeg_exe()]
+        if pre_ts > 0:
+            cmd += ["-ss", f"{pre_ts:.6f}"]
+        cmd += [
             "-i",       self._path,
+            "-ss",      f"{fine_ts:.6f}",
             "-f",       "rawvideo",
             "-pix_fmt", "rgb24",
             "-vf",      self._build_vf(),
@@ -443,36 +557,247 @@ class PlayerWidget(QWidget):
         ]
         try:
             self._pipe_proc  = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
             self._pipe_frame = start_frame
+            self._start_reader_thread()
         except Exception as exc:
             print(f"[BlastPlayer] pipe open: {exc}")
             self._pipe_proc = None
 
     def _close_pipe(self):
+        self._stop_reader_thread()
         if self._pipe_proc is not None:
             try:
                 self._pipe_proc.stdout.close()
                 self._pipe_proc.terminate()
-                self._pipe_proc.wait(timeout=1)
             except Exception:
                 pass
             self._pipe_proc = None
 
-    def _read_pipe_frame(self) -> bytes | None:
-        """Read one frame from the open pipe. Returns None on EOF/error."""
-        if self._pipe_proc is None:
-            return None
-        w, h = self._effective_size()
-        nbytes = w * h * 3
+    def _open_lookahead(self):
+        """Pre-decode frame 0 into memory so it can be shown instantly at loop time."""
+        if self._loop_frame0 is not None or not self._path or not self._vid_w:
+            return
+        def _fill():
+            self._loop_frame0 = self._fetch_frame(0)
+        threading.Thread(target=_fill, daemon=True).start()
+
+    def _close_lookahead(self):
+        self._loop_frame0 = None
+
+    # ── RAM frame cache ──────────────────────────────────────────────── #
+
+    def _start_cache_build(self):
+        """
+        Decode all frames into a Python list in a background thread.
+        Once complete, self._frame_cache is a list[bytes]; playback and scrubbing
+        switch to serving directly from memory — zero subprocess latency.
+        Skipped silently if the video is too large for _CACHE_MAX_MB.
+        """
+        if not self._path or not self._vid_w or self._total_frames <= 0:
+            return
+        w, h       = self._effective_size()
+        frame_size = w * h * 3
+        total_mb   = (self._total_frames * frame_size) / 1_048_576
+        if total_mb > self._CACHE_MAX_MB:
+            return
+
+        self._frame_cache   = None
+        self._cache_loading = True
+        path   = self._path
+        vf     = self._build_vf()
+        nf     = self._total_frames
+        nbytes = frame_size
+
+        def _fill():
+            cmd = [
+                _ffmpeg_exe(),
+                "-i",       path,
+                "-f",       "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-vf",      vf,
+                "pipe:1",
+            ]
+            frames = []
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                for _ in range(nf):
+                    chunk = proc.stdout.read(nbytes)
+                    if len(chunk) < nbytes:
+                        break
+                    frames.append(bytes(chunk))
+                try:
+                    proc.stdout.close()
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            except Exception as exc:
+                print(f"[BlastPlayer] cache build: {exc}")
+
+            if frames:
+                self._frame_cache = frames
+            self._cache_loading = False
+
+        threading.Thread(target=_fill, daemon=True).start()
+
+    def _open_loop_pipe(self):
+        """Pre-warm a pipe from frame 0 so the loop swap is instantaneous."""
+        if self._loop_pipe_proc is not None or not self._path or not self._vid_w:
+            return
+        self._loop_reader_stop.clear()
+        self._loop_pipe_queue = queue.Queue(maxsize=4)
+        cmd = [
+            _ffmpeg_exe(),
+            "-i",       self._path,
+            "-f",       "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-vf",      self._build_vf(),
+            "pipe:1",
+        ]
         try:
-            raw = self._pipe_proc.stdout.read(nbytes)
-        except Exception:
-            return None
-        return raw if len(raw) == nbytes else None
+            self._loop_pipe_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = self._loop_pipe_proc
+            q    = self._loop_pipe_queue
+            stop = self._loop_reader_stop
+            self._loop_pipe_thread = threading.Thread(
+                target=self._pipe_reader_loop,
+                args=(proc, q, stop),
+                daemon=True)
+            self._loop_pipe_thread.start()
+        except Exception as exc:
+            print(f"[BlastPlayer] loop pipe: {exc}")
+            self._loop_pipe_proc = None
+
+    def _close_loop_pipe(self):
+        self._loop_reader_stop.set()
+        self._loop_pipe_thread = None
+        if self._loop_pipe_proc is not None:
+            try:
+                self._loop_pipe_proc.stdout.close()
+                self._loop_pipe_proc.terminate()
+            except Exception:
+                pass
+            self._loop_pipe_proc = None
+        if self._loop_pipe_queue is not None:
+            while True:
+                try:
+                    self._loop_pipe_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._loop_pipe_queue = None
+        self._loop_reader_stop.clear()
+
+    def _start_reader_thread(self):
+        self._reader_stop.clear()
+        self._frame_queue = queue.Queue(maxsize=4)
+        proc = self._pipe_proc
+        q    = self._frame_queue
+        stop = self._reader_stop
+        self._reader_thread = threading.Thread(
+            target=self._pipe_reader_loop,
+            args=(proc, q, stop),
+            daemon=True)
+        self._reader_thread.start()
+
+    def _stop_reader_thread(self):
+        """Signal the reader to exit and drain the queue so it can unblock."""
+        self._reader_stop.set()
+        self._reader_thread = None
+        while True:                          # drain so a blocked put() can complete
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _pipe_reader_loop(self, proc, q, stop):
+        """Background: reads frames from proc and puts them into q."""
+        w, h   = self._effective_size()
+        nbytes = w * h * 3
+        while not stop.is_set():
+            try:
+                raw = proc.stdout.read(nbytes)
+            except Exception:
+                break
+            if len(raw) < nbytes:
+                try:
+                    q.put(None, timeout=1.0)    # EOF sentinel
+                except queue.Full:
+                    pass
+                break
+            q.put(bytes(raw))   # blocks if queue full — fine for background thread
+
+    # ── Reverse frame cache ──────────────────────────────────────────── #
+
+    _REVERSE_BATCH = 60   # frames decoded per cache fill
+
+    def _build_reverse_cache(self, up_to_frame: int):
+        """
+        Decode a batch of frames ending at *up_to_frame* in a background
+        thread so the UI doesn't freeze.  The playback timer is stopped
+        first and restarted via _resume_reverse() when the cache is ready.
+        """
+        if self._cache_building:
+            return
+        self._cache_building = True
+        self._timer.stop()          # pause ticking while we fill
+
+        start_frame = max(0, up_to_frame - self._REVERSE_BATCH + 1)
+        w, h        = self._effective_size()
+        nbytes      = w * h * 3
+        n_frames    = up_to_frame - start_frame + 1
+        path        = self._path
+        vf          = self._build_vf()
+
+        def _fill():
+            pre_offset = min(start_frame, int(self._fps * 4))
+            pre_frame  = start_frame - pre_offset
+            pre_ts     = pre_frame  / self._fps
+            fine_ts    = pre_offset / self._fps
+
+            cmd = [_ffmpeg_exe()]
+            if pre_ts > 0:
+                cmd += ["-ss", f"{pre_ts:.6f}"]
+            cmd += [
+                "-i",        path,
+                "-ss",       f"{fine_ts:.6f}",
+                "-frames:v", str(n_frames),
+                "-f",        "rawvideo",
+                "-pix_fmt",  "rgb24",
+                "-vf",       vf,
+                "pipe:1",
+            ]
+            frames = []
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                for i in range(n_frames):
+                    chunk = proc.stdout.read(nbytes)
+                    if len(chunk) < nbytes:
+                        break
+                    frames.append((start_frame + i, bytes(chunk)))
+                proc.stdout.close()
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception as exc:
+                print(f"[BlastPlayer] reverse cache: {exc}")
+
+            # Store reversed so pop() gives descending frame numbers
+            self._reverse_cache  = list(reversed(frames))
+            self._cache_building = False
+            # Re-enter the Qt main thread to restart the timer
+            QTimer.singleShot(0, self._resume_reverse)
+
+        threading.Thread(target=_fill, daemon=True).start()
+
+    def _resume_reverse(self):
+        """Called on the main thread after the reverse cache has been filled."""
+        if self._is_playing and self._play_reverse and self._reverse_cache:
+            interval = max(1, int(1000 / (self._fps * self._speed)))
+            self._timer.start(interval)
 
     # ------------------------------------------------------------------ #
     #  UI                                                                  #
@@ -522,7 +847,7 @@ class PlayerWidget(QWidget):
         )
         sc_row.addWidget(self._frames_lbl)
 
-        self._scrubber = QSlider(Qt.Horizontal)
+        self._scrubber = ScrubberSlider(Qt.Horizontal)
         self._scrubber.setRange(0, 0)
         self._scrubber.setStyleSheet(self._scrubber_style())
         self._scrubber.sliderPressed.connect(self._on_scrubber_pressed)
@@ -673,18 +998,24 @@ class PlayerWidget(QWidget):
         self._play_btn.setIcon(_icon("pause.png"))
         self._play_btn.setText("")
 
-        if not reverse:
+        if reverse:
+            self._reverse_cache = []
+        elif self._frame_cache is not None:
+            self._pipe_frame = self._current_frame   # position in cache
+        else:
             self._open_pipe(self._current_frame)
+
+        self._start_audio()
 
         interval = max(1, int(1000 / (self._fps * self._speed)))
         self._timer.start(interval)
-        self._start_audio()
 
     def _pause(self):
         self._is_playing   = False
         self._play_reverse = False
         self._timer.stop()
         self._close_pipe()
+        self._close_loop_pipe()
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._stop_audio()
@@ -694,35 +1025,124 @@ class PlayerWidget(QWidget):
             return
 
         if self._play_reverse:
-            # Accurate single-frame reverse
-            if self._current_frame <= 0:
-                if self._loop:
-                    self._seek_no_render(self._total_frames - 1)
-                    self._start_audio()
-                else:
-                    self._pause()
-                return
-            target = self._current_frame - 1
-            raw = self._fetch_frame(target)
-            if raw is None:
-                self._pause()
-                return
-            self._current_frame = target
-            self._render_raw(raw)
-        else:
-            # Read next frame from the pipe
-            raw = self._read_pipe_frame()
-            if raw is None:
-                if self._loop:
-                    self._seek_no_render(0)
-                    self._open_pipe(0)
-                    self._start_audio()
+            # ── Reverse: pop from pre-decoded cache ──────────────────── #
+            if not self._reverse_cache and not self._cache_building:
+                if self._current_frame <= 0:
+                    if self._loop:
+                        self._seek_no_render(self._total_frames - 1)
+                        self._reverse_cache = []
+                        self._start_audio()
+                        self._scrubber.blockSignals(True)
+                        self._scrubber.setValue(self._current_frame)
+                        self._scrubber.blockSignals(False)
+                        self._update_info()
+                    else:
+                        self._pause()
                     return
-                self._pause()
-                return
+                self._build_reverse_cache(self._current_frame)
+                return   # timer restarted by _resume_reverse when cache ready
+
+            if not self._reverse_cache:
+                return   # still building
+
+            frame_num, raw      = self._reverse_cache.pop()
+            self._current_frame = frame_num
             self._render_raw(raw)
-            self._current_frame = self._pipe_frame
-            self._pipe_frame   += 1
+
+        else:
+            # ── Forward play ─────────────────────────────────────────── #
+
+            # Upgrade from pipe to cache the moment the cache becomes ready
+            if self._frame_cache is not None and self._pipe_proc is not None:
+                self._close_pipe()
+                self._close_loop_pipe()
+                self._pipe_frame = self._current_frame + 1
+
+            if self._frame_cache is not None:
+                # ── Cache mode: serve frames directly from RAM ──────── #
+                pos = self._pipe_frame
+                if pos >= len(self._frame_cache):
+                    if self._loop:
+                        self._stop_audio()
+                        self._pipe_frame    = 0
+                        self._current_frame = 0
+                        self._start_audio()
+                        self._scrubber.blockSignals(True)
+                        self._scrubber.setValue(0)
+                        self._scrubber.blockSignals(False)
+                        self._update_info()
+                    else:
+                        self._pause()
+                    return
+                self._render_raw(self._frame_cache[pos])
+                self._current_frame = pos
+                self._pipe_frame    = pos + 1
+
+            else:
+                # ── Pipe mode: one frame per tick ───────────────────── #
+                try:
+                    item = self._frame_queue.get_nowait()
+                except queue.Empty:
+                    return   # decode not ready — try next tick
+
+                if item is None:
+                    # EOF
+                    if self._loop:
+                        self._stop_audio()
+                        if self._loop_pipe_proc is not None:
+                            # Seamless swap: adopt the pre-warmed loop pipe
+                            self._reader_stop.set()
+                            self._reader_thread = None
+                            while True:
+                                try:
+                                    self._frame_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+                            if self._pipe_proc is not None:
+                                try:
+                                    self._pipe_proc.stdout.close()
+                                    self._pipe_proc.terminate()
+                                except Exception:
+                                    pass
+                                self._pipe_proc = None
+                            self._pipe_proc     = self._loop_pipe_proc
+                            self._frame_queue   = self._loop_pipe_queue
+                            self._reader_thread = self._loop_pipe_thread
+                            self._reader_stop   = self._loop_reader_stop
+                            self._pipe_frame    = 0
+                            self._loop_pipe_proc   = None
+                            self._loop_pipe_queue  = None
+                            self._loop_pipe_thread = None
+                            self._loop_reader_stop = threading.Event()
+                            if self._loop_frame0 is not None:
+                                self._render_raw(self._loop_frame0)
+                                self._loop_frame0 = None
+                        else:
+                            # Fallback: fresh pipe (has a brief gap)
+                            raw0 = self._loop_frame0
+                            self._open_pipe(0)
+                            if raw0 is not None:
+                                self._render_raw(raw0)
+                        self._current_frame = 0
+                        self._start_audio()
+                        self._scrubber.blockSignals(True)
+                        self._scrubber.setValue(0)
+                        self._scrubber.blockSignals(False)
+                        self._update_info()
+                    else:
+                        self._pause()
+                    return
+
+                self._render_raw(item)
+                self._pipe_frame += 1
+                self._current_frame = self._pipe_frame - 1
+                if self._loop and self._total_frames > 0:
+                    remaining = self._total_frames - self._current_frame
+                    if remaining <= self._LOOKAHEAD_FRAMES:
+                        if self._loop_frame0 is None:
+                            self._open_lookahead()
+                        if self._loop_pipe_proc is None:
+                            self._open_loop_pipe()
 
         if not self._scrubber_moving:
             self._scrubber.blockSignals(True)
@@ -768,6 +1188,7 @@ class PlayerWidget(QWidget):
             return
         frame_num = max(0, min(frame_num, self._total_frames - 1))
         self._current_frame = frame_num
+        self._pipe_frame    = frame_num   # keep cache position in sync
         self._show_frame(frame_num)
         self._scrubber.blockSignals(True)
         self._scrubber.setValue(frame_num)
@@ -779,6 +1200,9 @@ class PlayerWidget(QWidget):
         self._current_frame = max(0, min(frame_num, self._total_frames - 1))
 
     def _show_frame(self, frame_num: int):
+        if self._frame_cache and frame_num < len(self._frame_cache):
+            self._render_raw(self._frame_cache[frame_num])
+            return
         raw = self._fetch_frame(frame_num)
         if raw:
             self._render_raw(raw)
@@ -851,18 +1275,29 @@ class PlayerWidget(QWidget):
         self._scrubber_moving = False
         self._current_frame   = self._scrubber.value()
         if self._is_playing:
-            if not self._play_reverse:
+            self._stop_audio()
+            if self._play_reverse:
+                self._reverse_cache = []
+            elif self._frame_cache is not None:
+                self._pipe_frame = self._current_frame   # reposition in cache
+            else:
                 self._open_pipe(self._current_frame)
-            self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
             self._start_audio()
+            self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
+        else:
+            self._show_frame(self._current_frame)
+            self._update_info()
 
     def _on_scrubber_moved(self, value: int):
         if not self._path:
             return
-        raw = self._fetch_frame(value)
-        if raw:
-            self._render_raw(raw)
-            self._current_frame = value
+        if self._frame_cache and value < len(self._frame_cache):
+            self._render_raw(self._frame_cache[value])
+        else:
+            raw = self._fetch_frame(value)
+            if raw:
+                self._render_raw(raw)
+        self._current_frame = value
         self._update_info()
         if self._audio_scrub_enabled:
             self._scrub_debounce.start(80)
@@ -879,6 +1314,9 @@ class PlayerWidget(QWidget):
     def _on_loop_toggled(self, checked: bool):
         self._loop = checked
         self._loop_btn.setStyleSheet(self._loop_style(checked))
+        if not checked:
+            self._close_lookahead()
+            self._close_loop_pipe()
 
     # ------------------------------------------------------------------ #
     #  Audio                                                               #
@@ -890,12 +1328,13 @@ class PlayerWidget(QWidget):
         if not Path(ffplay).exists():
             return
         seek = self._current_frame / self._fps
+        cmd = [ffplay, "-nodisp", "-autoexit",
+               "-ss",     f"{seek:.4f}",
+               "-volume", str(self._volume),
+               self._path]
         try:
             self._audio_proc = subprocess.Popen(
-                [ffplay, "-nodisp", "-autoexit",
-                 "-ss",     f"{seek:.4f}",
-                 "-volume", str(self._volume),
-                 self._path],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -943,11 +1382,11 @@ class PlayerWidget(QWidget):
 
     def _update_info(self):
         f = self._current_frame
-        self._frame_num_lbl.setText(str(f))
+        self._frame_num_lbl.setText(str(f + 1))
         self._frames_lbl.setText(f"{self._total_frames} frames")
         self._fps_lbl.setText(f"{self._fps:.2f} fps")
         if hasattr(self, '_on_frame_changed'):
-            self._on_frame_changed(f)
+            self._on_frame_changed(f + 1)
 
     def set_frame_callback(self, fn):
         self._on_frame_changed = fn
@@ -1006,12 +1445,18 @@ class PlayerWidget(QWidget):
     def _rerender(self):
         """
         Re-fetch the current frame with updated -vf filters.
-        If playing forward, the pipe must be re-opened so the new vf takes effect.
+        Cache, lookahead, and loop pipe are all invalidated — they were built
+        with the old filter chain.
         """
+        self._close_lookahead()
+        self._close_loop_pipe()
+        self._frame_cache   = None   # stale — wrong filters
+        self._cache_loading = False
         if self._is_playing and not self._play_reverse:
             self._open_pipe(self._current_frame)
         elif self._path and self._current_frame >= 0:
             self._show_frame(self._current_frame)
+        self._start_cache_build()
 
     # ------------------------------------------------------------------ #
     #  Keyboard                                                            #
@@ -1043,11 +1488,18 @@ class PlayerWidget(QWidget):
     def _cleanup(self):
         self._timer.stop()
         self._close_pipe()
+        self._close_loop_pipe()
+        self._close_lookahead()
         self._stop_audio()
-        self._path          = ""
-        self._current_frame = 0
-        self._is_playing    = False
-        self._current_pixmap = None
+        self._path             = ""
+        self._current_frame    = 0
+        self._is_playing       = False
+        self._current_pixmap   = None
+        self._reverse_cache    = []
+        self._cache_building   = False
+        self._loop_frame0      = None
+        self._frame_cache      = None
+        self._cache_loading    = False
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._canvas.display().clear()
@@ -1095,6 +1547,9 @@ class PlayerWidget(QWidget):
 
 class BlastPlayerWindow(QMainWindow):
 
+    _SETTINGS_ORG  = "BlastPlayer"
+    _SETTINGS_APP  = "BlastPlayer"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("BlastPlayer")
@@ -1114,6 +1569,7 @@ class BlastPlayerWindow(QMainWindow):
 
         self._build_menu()
         self._setup_shortcuts()
+        self._restore_geometry()
 
     # ------------------------------------------------------------------ #
     #  Title                                                               #
@@ -1169,6 +1625,7 @@ class BlastPlayerWindow(QMainWindow):
         pb.addSeparator()
         la = pb.addAction("Loop"); la.setCheckable(True)
         la.triggered.connect(self._player._loop_btn.setChecked)
+        self._player._loop_btn.toggled.connect(la.setChecked)
         pb.addSeparator()
         ss = pb.addMenu("Stepping and Scrubbing")
         los = ss.addAction("Loop on Step"); los.setShortcut("Ctrl+Shift+."); los.setCheckable(True)
@@ -1241,9 +1698,24 @@ class BlastPlayerWindow(QMainWindow):
         self._stack.setCurrentIndex(1)
         self._player.setFocus()
         self._update_title(0)
+        # PlayerWidget was hidden during load_video so _display had no size yet;
+        # defer one tick so the layout has settled before we scale the pixmap.
+        QTimer.singleShot(0, self._player._refresh_display)
 
     def _setup_shortcuts(self):
         pass  # handled via keyPressEvent
+
+    def _restore_geometry(self):
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        geom = s.value("windowGeometry")
+        if geom:
+            self.restoreGeometry(geom)
+        else:
+            self.resize(1280, 720)
+
+    def _save_geometry(self):
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        s.setValue("windowGeometry", self.saveGeometry())
 
     def _toggle_fullscreen(self):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
@@ -1257,8 +1729,12 @@ class BlastPlayerWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def _on_about(self):
-        from dialogs.about_dialog import AboutDialog
-        AboutDialog(self).exec_()
+        try:
+            from dialogs.about_dialog import AboutDialog
+            AboutDialog(self).exec_()
+        except ImportError:
+            QMessageBox.about(self, "BlastPlayer",
+                "BlastPlayer\nFFmpeg-powered frame-accurate video player")
 
     def _on_open(self):
         exts = " ".join(f"*{e}" for e in sorted(constants.VIDEO_EXTS))
@@ -1287,5 +1763,6 @@ class BlastPlayerWindow(QMainWindow):
                 break
 
     def closeEvent(self, event):
+        self._save_geometry()
         self._player.stop()
         super().closeEvent(event)
