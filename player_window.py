@@ -48,6 +48,16 @@ from PyQt5.QtGui import (
     QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer,
     QOpenGLTexture, QSurfaceFormat,
 )
+try:
+    from OpenGL.GL import (
+        glClearColor, glClear, glViewport, glDrawArrays,
+        GL_COLOR_BUFFER_BIT, GL_TRIANGLES, GL_FLOAT,
+    )
+except ImportError:
+    raise SystemExit(
+        "[BlastPlayer] PyOpenGL is required for GPU rendering.\n"
+        "Install it with:  pip install PyOpenGL"
+    )
 from PyQt5.QtWidgets import QStyle, QStyleOptionSlider
 
 from core import constants
@@ -371,14 +381,13 @@ class VideoCanvas(QOpenGLWidget):
         self._texture.setMagnificationFilter(QOpenGLTexture.Linear)
         self._texture.setWrapMode(QOpenGLTexture.ClampToEdge)
 
-        self.context().functions().glClearColor(0, 0, 0, 1)
+        glClearColor(0, 0, 0, 1)
 
     def resizeGL(self, w: int, h: int):
-        self.context().functions().glViewport(0, 0, w, h)
+        glViewport(0, 0, w, h)
 
     def paintGL(self):
-        gl = self.context().functions()
-        gl.glClear(0x4000)              # GL_COLOR_BUFFER_BIT
+        glClear(GL_COLOR_BUFFER_BIT)
 
         if not self._frame_raw or not self._vid_w or self._prog is None:
             return
@@ -402,14 +411,13 @@ class VideoCanvas(QOpenGLWidget):
         self._texture.bind(0)
         self._prog.setUniformValue("u_frame", 0)
 
-        GL_FLOAT = 0x1406
-        stride   = 4 * 4                # 4 floats × 4 bytes
+        stride = 4 * 4                  # 4 floats × 4 bytes
         self._prog.enableAttributeArray(0)
         self._prog.enableAttributeArray(1)
         self._prog.setAttributeBuffer(0, GL_FLOAT, 0,     2, stride)
         self._prog.setAttributeBuffer(1, GL_FLOAT, 2 * 4, 2, stride)
 
-        gl.glDrawArrays(0x0004, 0, 6)   # GL_TRIANGLES
+        glDrawArrays(GL_TRIANGLES, 0, 6)
 
         self._prog.disableAttributeArray(0)
         self._prog.disableAttributeArray(1)
