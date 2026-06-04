@@ -26,6 +26,7 @@ No OpenCV dependency.
 
 import sys
 import json
+import time
 import queue
 import threading
 import subprocess
@@ -377,6 +378,10 @@ class PlayerWidget(QWidget):
         self._pipe_proc       = None     # subprocess.Popen | None
         self._pipe_frame      = 0        # frame index pipe is currently at
         self._loop_frame0     = None     # raw bytes of frame 0, pre-decoded into memory
+
+        # Wall-clock sync — used by both cache and pipe paths
+        self._play_clock_start = 0.0    # time.monotonic() when playback (re)started
+        self._play_frame_start = 0      # _current_frame when playback (re)started
 
         # Pipe reader thread — keeps pipe reads off the main thread
         self._frame_queue   = queue.Queue(maxsize=4)
@@ -1001,10 +1006,12 @@ class PlayerWidget(QWidget):
         if reverse:
             self._reverse_cache = []
         elif self._frame_cache is not None:
-            self._pipe_frame = self._current_frame   # position in cache
+            self._pipe_frame = self._current_frame
         else:
             self._open_pipe(self._current_frame)
 
+        self._play_frame_start = self._current_frame
+        self._play_clock_start = time.monotonic()
         self._start_audio()
 
         interval = max(1, int(1000 / (self._fps * self._speed)))
@@ -1050,23 +1057,25 @@ class PlayerWidget(QWidget):
             self._render_raw(raw)
 
         else:
-            # ── Forward play ─────────────────────────────────────────── #
+            # ── Forward play (wall-clock sync) ────────────────────────── #
+            elapsed      = time.monotonic() - self._play_clock_start
+            target_frame = int(self._play_frame_start + elapsed * self._fps * self._speed)
 
             # Upgrade from pipe to cache the moment the cache becomes ready
             if self._frame_cache is not None and self._pipe_proc is not None:
                 self._close_pipe()
                 self._close_loop_pipe()
-                self._pipe_frame = self._current_frame + 1
 
             if self._frame_cache is not None:
-                # ── Cache mode: serve frames directly from RAM ──────── #
-                pos = self._pipe_frame
-                if pos >= len(self._frame_cache):
+                # ── Cache mode ──────────────────────────────────────── #
+                if target_frame >= len(self._frame_cache):
                     if self._loop:
                         self._stop_audio()
-                        self._current_frame = 0
-                        self._render_raw(self._frame_cache[0])  # show frame 0 now, not next tick
-                        self._pipe_frame    = 1
+                        self._play_frame_start = 0
+                        self._play_clock_start = time.monotonic()
+                        self._current_frame    = 0
+                        self._render_raw(self._frame_cache[0])
+                        self._pipe_frame       = 1
                         self._start_audio()
                         self._scrubber.blockSignals(True)
                         self._scrubber.setValue(0)
@@ -1075,19 +1084,33 @@ class PlayerWidget(QWidget):
                     else:
                         self._pause()
                     return
-                self._render_raw(self._frame_cache[pos])
-                self._current_frame = pos
-                self._pipe_frame    = pos + 1
+
+                if target_frame <= self._current_frame:
+                    return  # not yet time for the next frame
+
+                self._render_raw(self._frame_cache[target_frame])
+                self._current_frame = target_frame
+                self._pipe_frame    = target_frame + 1
 
             else:
-                # ── Pipe mode: one frame per tick ───────────────────── #
-                try:
-                    item = self._frame_queue.get_nowait()
-                except queue.Empty:
-                    return   # decode not ready — try next tick
+                # ── Pipe mode ───────────────────────────────────────── #
+                raw = None
+                eof = False
+                while self._pipe_frame <= target_frame:
+                    try:
+                        item = self._frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is None:
+                        eof = True
+                        break
+                    raw = item
+                    self._pipe_frame += 1
 
-                if item is None:
-                    # EOF
+                if eof:
+                    if raw is not None:
+                        self._render_raw(raw)
+                        self._current_frame = self._pipe_frame - 1
                     if self._loop:
                         self._stop_audio()
                         if self._loop_pipe_proc is not None:
@@ -1119,12 +1142,13 @@ class PlayerWidget(QWidget):
                                 self._render_raw(self._loop_frame0)
                                 self._loop_frame0 = None
                         else:
-                            # Fallback: fresh pipe (has a brief gap)
                             raw0 = self._loop_frame0
                             self._open_pipe(0)
                             if raw0 is not None:
                                 self._render_raw(raw0)
-                        self._current_frame = 0
+                        self._current_frame    = 0
+                        self._play_frame_start = 0
+                        self._play_clock_start = time.monotonic()
                         self._start_audio()
                         self._scrubber.blockSignals(True)
                         self._scrubber.setValue(0)
@@ -1134,16 +1158,16 @@ class PlayerWidget(QWidget):
                         self._pause()
                     return
 
-                self._render_raw(item)
-                self._pipe_frame += 1
-                self._current_frame = self._pipe_frame - 1
-                if self._loop and self._total_frames > 0:
-                    remaining = self._total_frames - self._current_frame
-                    if remaining <= self._LOOKAHEAD_FRAMES:
-                        if self._loop_frame0 is None:
-                            self._open_lookahead()
-                        if self._loop_pipe_proc is None:
-                            self._open_loop_pipe()
+                if raw is not None:
+                    self._render_raw(raw)
+                    self._current_frame = self._pipe_frame - 1
+                    if self._loop and self._total_frames > 0:
+                        remaining = self._total_frames - self._current_frame
+                        if remaining <= self._LOOKAHEAD_FRAMES:
+                            if self._loop_frame0 is None:
+                                self._open_lookahead()
+                            if self._loop_pipe_proc is None:
+                                self._open_loop_pipe()
 
         if not self._scrubber_moving:
             self._scrubber.blockSignals(True)
@@ -1280,9 +1304,11 @@ class PlayerWidget(QWidget):
             if self._play_reverse:
                 self._reverse_cache = []
             elif self._frame_cache is not None:
-                self._pipe_frame = self._current_frame   # reposition in cache
+                self._pipe_frame = self._current_frame
             else:
                 self._open_pipe(self._current_frame)
+            self._play_frame_start = self._current_frame
+            self._play_clock_start = time.monotonic()
             self._start_audio()
             self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
         else:
@@ -1501,6 +1527,8 @@ class PlayerWidget(QWidget):
         self._loop_frame0      = None
         self._frame_cache      = None
         self._cache_loading    = False
+        self._play_clock_start = 0.0
+        self._play_frame_start = 0
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._canvas.display().clear()
