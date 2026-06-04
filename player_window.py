@@ -27,6 +27,7 @@ No OpenCV dependency.
 import sys
 import json
 import time
+import array
 import queue
 import threading
 import subprocess
@@ -38,10 +39,15 @@ from PyQt5.QtWidgets import (
     QPushButton, QSlider, QSizePolicy,
     QAction, QFileDialog, QMessageBox,
     QFrame, QToolButton, QActionGroup, QComboBox, QShortcut,
+    QOpenGLWidget,
 )
-from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QRect, QPoint, QSettings
-from PyQt5.QtGui import QKeySequence
-from PyQt5.QtGui import QImage, QPixmap, QFont, QDragEnterEvent, QDropEvent, QIcon, QPainter
+from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QSettings
+from PyQt5.QtGui import (
+    QKeySequence,
+    QImage, QPixmap, QFont, QDragEnterEvent, QDropEvent, QIcon,
+    QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer,
+    QOpenGLTexture, QSurfaceFormat,
+)
 from PyQt5.QtWidgets import QStyle, QStyleOptionSlider
 
 from core import constants
@@ -278,29 +284,180 @@ class ScrubberSlider(QSlider):
 #  Video canvas
 # ══════════════════════════════════════════════════════════════════════════════
 
-class VideoCanvas(QWidget):
-    """Pure black canvas — video QLabel fills it, wheel/drag signals for zoom & pan."""
+class VideoCanvas(QOpenGLWidget):
+    """
+    GPU-accelerated video display.
+    Raw RGB24 bytes are uploaded as a GL texture each frame; the GPU
+    handles all scaling and letterboxing — zero CPU scaling per frame.
+    """
 
     zoom_scrolled = pyqtSignal(int)       # +1 = in, -1 = out
     pan_dragged   = pyqtSignal(int, int)  # dx, dy
 
+    _VERT = """
+        attribute vec2 a_pos;
+        attribute vec2 a_tex;
+        varying   vec2 v_tex;
+        void main() {
+            gl_Position = vec4(a_pos, 0.0, 1.0);
+            v_tex = a_tex;
+        }
+    """
+    _FRAG = """
+        uniform sampler2D u_frame;
+        varying vec2 v_tex;
+        void main() {
+            // flip V: QImage row-0 = top, GL row-0 = bottom
+            gl_FragColor = texture2D(u_frame, vec2(v_tex.x, 1.0 - v_tex.y));
+        }
+    """
+
     def __init__(self, parent=None):
+        fmt = QSurfaceFormat()
+        fmt.setSwapInterval(0)          # no vsync — timer drives frame rate
+        QSurfaceFormat.setDefaultFormat(fmt)
         super().__init__(parent)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet("background: black;")
-        self._drag_pos: QPoint | None = None
 
-        self._display = QLabel(self)
-        self._display.setAlignment(Qt.AlignCenter)
-        self._display.setStyleSheet("background: black;")
-        self._display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._frame_raw = None          # bytes | None
+        self._vid_w     = 0
+        self._vid_h     = 0
+        self._zoom      = 1.0
+        self._pan_x     = 0
+        self._pan_y     = 0
+        self._dirty     = False         # True → new frame waiting to upload
+        self._drag_pos  = None
 
-    def display(self) -> QLabel:
-        return self._display
+        # GL objects — initialised in initializeGL
+        self._prog      = None
+        self._vbo       = None
+        self._texture   = None
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._display.setGeometry(self.rect())
+    # ── Public API ───────────────────────────────────────────────────── #
+
+    def set_frame(self, raw: bytes, vid_w: int, vid_h: int):
+        self._frame_raw = raw
+        self._vid_w     = vid_w
+        self._vid_h     = vid_h
+        self._dirty     = True
+        self.update()
+
+    def clear_frame(self):
+        self._frame_raw = None
+        self.update()
+
+    def set_transform(self, zoom: float, pan_x: int, pan_y: int):
+        self._zoom  = zoom
+        self._pan_x = pan_x
+        self._pan_y = pan_y
+        self.update()
+
+    # ── OpenGL callbacks ─────────────────────────────────────────────── #
+
+    def initializeGL(self):
+        self._prog = QOpenGLShaderProgram(self)
+        self._prog.addShaderFromSourceCode(QOpenGLShader.Vertex,   self._VERT)
+        self._prog.addShaderFromSourceCode(QOpenGLShader.Fragment, self._FRAG)
+        self._prog.bindAttributeLocation("a_pos", 0)
+        self._prog.bindAttributeLocation("a_tex", 1)
+        if not self._prog.link():
+            print(f"[BlastPlayer] GL link error: {self._prog.log()}")
+
+        self._vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._vbo.create()
+        self._vbo.setUsagePattern(QOpenGLBuffer.DynamicDraw)
+
+        self._texture = QOpenGLTexture(QOpenGLTexture.Target2D)
+        self._texture.setMinificationFilter(QOpenGLTexture.Linear)
+        self._texture.setMagnificationFilter(QOpenGLTexture.Linear)
+        self._texture.setWrapMode(QOpenGLTexture.ClampToEdge)
+
+        self.context().functions().glClearColor(0, 0, 0, 1)
+
+    def resizeGL(self, w: int, h: int):
+        self.context().functions().glViewport(0, 0, w, h)
+
+    def paintGL(self):
+        gl = self.context().functions()
+        gl.glClear(0x4000)              # GL_COLOR_BUFFER_BIT
+
+        if not self._frame_raw or not self._vid_w or self._prog is None:
+            return
+
+        if self._dirty:
+            qimg = QImage(self._frame_raw, self._vid_w, self._vid_h,
+                          self._vid_w * 3, QImage.Format_RGB888)
+            self._texture.setData(qimg, QOpenGLTexture.DontGenerateMipMaps)
+            self._dirty = False
+
+        verts = self._quad_vertices()
+        if not verts:
+            return
+
+        buf = array.array('f', verts)
+        raw = buf.tobytes()
+        self._vbo.bind()
+        self._vbo.allocate(raw, len(raw))
+
+        self._prog.bind()
+        self._texture.bind(0)
+        self._prog.setUniformValue("u_frame", 0)
+
+        GL_FLOAT = 0x1406
+        stride   = 4 * 4                # 4 floats × 4 bytes
+        self._prog.enableAttributeArray(0)
+        self._prog.enableAttributeArray(1)
+        self._prog.setAttributeBuffer(0, GL_FLOAT, 0,     2, stride)
+        self._prog.setAttributeBuffer(1, GL_FLOAT, 2 * 4, 2, stride)
+
+        gl.glDrawArrays(0x0004, 0, 6)   # GL_TRIANGLES
+
+        self._prog.disableAttributeArray(0)
+        self._prog.disableAttributeArray(1)
+        self._texture.release()
+        self._prog.release()
+        self._vbo.release()
+
+    # ── Quad geometry ────────────────────────────────────────────────── #
+
+    def _quad_vertices(self):
+        """24 floats: 6 × (x, y, u, v) describing the letterboxed video quad."""
+        vw, vh = self.width(), self.height()
+        if vw == 0 or vh == 0 or self._vid_w == 0 or self._vid_h == 0:
+            return []
+
+        vid_ar  = self._vid_w / self._vid_h
+        view_ar = vw / vh
+
+        if self._zoom <= 1.0:
+            if vid_ar >= view_ar:
+                sx, sy = 1.0, view_ar / vid_ar
+            else:
+                sx, sy = vid_ar / view_ar, 1.0
+            x0, x1 = -sx, sx
+            y0, y1 = -sy, sy            # NDC: y0 = bottom, y1 = top
+            u0, u1, v0, v1 = 0.0, 1.0, 0.0, 1.0
+        else:
+            x0, x1, y0, y1 = -1.0, 1.0, -1.0, 1.0
+            fit = (vw / self._vid_w) if vid_ar >= view_ar else (vh / self._vid_h)
+            total  = fit * self._zoom
+            disp_w = self._vid_w * total
+            disp_h = self._vid_h * total
+            px = max(0.0, min(float(self._pan_x), max(0.0, disp_w - vw)))
+            py = max(0.0, min(float(self._pan_y), max(0.0, disp_h - vh)))
+            u0 = px / disp_w;           u1 = min(1.0, (px + vw) / disp_w)
+            v0 = py / disp_h;           v1 = min(1.0, (py + vh) / disp_h)
+
+        # Two triangles; v0 = image-top → NDC-top (y1), v1 = image-bottom → NDC-bottom (y0)
+        return [
+            x0, y1, u0, v0,   # top-left
+            x1, y1, u1, v0,   # top-right
+            x1, y0, u1, v1,   # bottom-right
+            x0, y1, u0, v0,   # top-left
+            x1, y0, u1, v1,   # bottom-right
+            x0, y0, u0, v1,   # bottom-left
+        ]
+
+    # ── Mouse / wheel ────────────────────────────────────────────────── #
 
     def wheelEvent(self, event):
         self.zoom_scrolled.emit(1 if event.angleDelta().y() > 0 else -1)
@@ -398,11 +555,6 @@ class PlayerWidget(QWidget):
         self._frame_cache   = None   # list[bytes] once ready, None while not cached
         self._cache_loading = False  # True while background decode is running
 
-        # Display-size QImage cache — frames pre-scaled in background, zero main-thread scaling
-        self._display_qimage_cache = None   # list[QImage] at display size
-        self._display_cache_size   = (0, 0) # (w, h) at which display cache was built
-
-
         # Reverse frame cache
         self._reverse_cache   = []      # list of (frame_num, raw_bytes), pop() = backward
         self._cache_building  = False   # True while background thread is filling cache
@@ -420,7 +572,6 @@ class PlayerWidget(QWidget):
 
         # Misc state
         self._scrubber_moving = False
-        self._current_pixmap  = None
         self._loop_on_step    = False
         self._loop_on_scrub   = False
 
@@ -649,39 +800,9 @@ class PlayerWidget(QWidget):
 
             if frames:
                 self._frame_cache = frames
-                # Kick off display cache build on the main thread once layout is settled
-                QTimer.singleShot(0, self._start_display_cache_build)
             self._cache_loading = False
 
         threading.Thread(target=_fill, daemon=True).start()
-
-    def _start_display_cache_build(self):
-        """
-        Scale every cached raw frame to the current display size using
-        SmoothTransformation in a background thread (QImage is thread-safe).
-        During playback the main thread then only needs QPixmap.fromImage()
-        on an already-correct-size image — no per-frame scaling at all.
-        """
-        if not self._frame_cache:
-            return
-        disp = self._canvas.display()
-        dw, dh = disp.width(), disp.height()
-        if dw == 0 or dh == 0:
-            return
-        w, h       = self._effective_size()
-        raw_frames = self._frame_cache  # local ref — safe across threads
-
-        def _scale():
-            display_frames = []
-            for raw in raw_frames:
-                qimg   = QImage(raw, w, h, w * 3, QImage.Format_RGB888)
-                scaled = qimg.scaled(dw, dh, Qt.KeepAspectRatio,
-                                     Qt.SmoothTransformation)
-                display_frames.append(scaled)
-            self._display_qimage_cache = display_frames
-            self._display_cache_size   = (dw, dh)
-
-        threading.Thread(target=_scale, daemon=True).start()
 
     def _open_loop_pipe(self):
         """Pre-warm a pipe from frame 0 so the loop swap is instantaneous."""
@@ -1105,14 +1226,6 @@ class PlayerWidget(QWidget):
 
             if self._frame_cache is not None:
                 # ── Cache mode ──────────────────────────────────────── #
-                disp      = self._canvas.display()
-                dw, dh    = disp.width(), disp.height()
-                use_dcache = (
-                    self._display_qimage_cache is not None
-                    and self._display_cache_size == (dw, dh)
-                    and self._zoom <= 1.0
-                )
-
                 if target_frame >= len(self._frame_cache):
                     if self._loop:
                         self._stop_audio()
@@ -1120,11 +1233,7 @@ class PlayerWidget(QWidget):
                         self._play_clock_start = time.monotonic()
                         self._current_frame    = 0
                         self._pipe_frame       = 1
-                        if use_dcache:
-                            disp.setPixmap(QPixmap.fromImage(
-                                self._display_qimage_cache[0]))
-                        else:
-                            self._render_raw(self._frame_cache[0])
+                        self._render_raw(self._frame_cache[0])
                         self._start_audio()
                         self._scrubber.blockSignals(True)
                         self._scrubber.setValue(0)
@@ -1137,11 +1246,7 @@ class PlayerWidget(QWidget):
                 if target_frame <= self._current_frame:
                     return  # not yet time for the next frame
 
-                if use_dcache:
-                    disp.setPixmap(QPixmap.fromImage(
-                        self._display_qimage_cache[target_frame]))
-                else:
-                    self._render_raw(self._frame_cache[target_frame])
+                self._render_raw(self._frame_cache[target_frame])
                 self._current_frame = target_frame
                 self._pipe_frame    = target_frame + 1
 
@@ -1290,60 +1395,18 @@ class PlayerWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def _render_raw(self, raw: bytes):
-        """Convert raw RGB24 bytes to QPixmap and display."""
+        """Upload raw RGB24 bytes to the GL canvas."""
         w, h = self._effective_size()
         if w == 0 or h == 0:
             return
-        qimg = QImage(raw, w, h, w * 3, QImage.Format_RGB888)
-        self._current_pixmap = QPixmap.fromImage(qimg)
-        self._refresh_display()
+        self._canvas.set_frame(raw, w, h)
 
     def _refresh_display(self):
-        if not self._current_pixmap or self._current_pixmap.isNull():
-            return
-        disp = self._canvas.display()
-        dw, dh = disp.width(), disp.height()
-        if dw == 0 or dh == 0:
-            return
-
-        transform = Qt.FastTransformation if self._is_playing else Qt.SmoothTransformation
-        if self._zoom <= 1.0:
-            scaled = self._current_pixmap.scaled(
-                disp.size(), Qt.KeepAspectRatio, transform
-            )
-            self._pan_x = 0
-            self._pan_y = 0
-            disp.setPixmap(scaled)
-        else:
-            pw = int(self._current_pixmap.width()  * self._zoom)
-            ph = int(self._current_pixmap.height() * self._zoom)
-            scaled_full = self._current_pixmap.scaled(
-                pw, ph, Qt.IgnoreAspectRatio, transform
-            )
-            self._pan_x = max(0, min(self._pan_x, max(0, pw - dw)))
-            self._pan_y = max(0, min(self._pan_y, max(0, ph - dh)))
-            vw = min(dw, pw)
-            vh = min(dh, ph)
-            crop = scaled_full.copy(QRect(self._pan_x, self._pan_y, vw, vh))
-            if vw < dw or vh < dh:
-                canvas = QPixmap(dw, dh)
-                canvas.fill(Qt.black)
-                p = QPainter(canvas)
-                p.drawPixmap((dw - vw) // 2, (dh - vh) // 2, crop)
-                p.end()
-                disp.setPixmap(canvas)
-            else:
-                disp.setPixmap(crop)
+        """Push current zoom/pan state to the GL canvas."""
+        self._canvas.set_transform(self._zoom, self._pan_x, self._pan_y)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        dw = self._canvas.display().width()
-        dh = self._canvas.display().height()
-        if (self._display_qimage_cache is not None
-                and self._display_cache_size != (dw, dh)):
-            self._display_qimage_cache = None
-            if self._frame_cache:
-                self._start_display_cache_build()
         self._refresh_display()
 
     # ------------------------------------------------------------------ #
@@ -1538,10 +1601,8 @@ class PlayerWidget(QWidget):
         """
         self._close_lookahead()
         self._close_loop_pipe()
-        self._frame_cache          = None
-        self._cache_loading        = False
-        self._display_qimage_cache = None
-        self._display_cache_size   = (0, 0)
+        self._frame_cache   = None
+        self._cache_loading = False
         if self._is_playing and not self._play_reverse:
             self._open_pipe(self._current_frame)
         elif self._path and self._current_frame >= 0:
@@ -1584,20 +1645,16 @@ class PlayerWidget(QWidget):
         self._path             = ""
         self._current_frame    = 0
         self._is_playing       = False
-        self._current_pixmap   = None
         self._reverse_cache    = []
         self._cache_building   = False
         self._loop_frame0      = None
-        self._frame_cache          = None
-        self._cache_loading        = False
-        self._display_qimage_cache = None
-        self._display_cache_size   = (0, 0)
-        self._play_clock_start     = 0.0
-        self._play_frame_start     = 0
+        self._frame_cache      = None
+        self._cache_loading    = False
+        self._play_clock_start = 0.0
+        self._play_frame_start = 0
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
-        self._canvas.display().clear()
-        self._canvas.display().setStyleSheet("background: black;")
+        self._canvas.clear_frame()
 
     # ------------------------------------------------------------------ #
     #  Style helpers                                                       #
