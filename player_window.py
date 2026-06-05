@@ -575,9 +575,10 @@ class VideoCanvas(QOpenGLWidget):
     zoom_scrolled = pyqtSignal(int)       # +1 = in, -1 = out
     pan_dragged   = pyqtSignal(int, int)  # dx, dy
 
-    # GLSL 1.30 — required for OCIO; OpenGL 3.0 core / compat
+    # GLSL 1.50 core — OpenGL 3.2 Core Profile (required by macOS; supported
+    # on all modern Windows/Linux drivers too).
     _VERT_SRC = """
-#version 130
+#version 150 core
 in  vec2 a_pos;
 in  vec2 a_tex;
 out vec2 v_tex;
@@ -588,7 +589,7 @@ void main() {
 """
     # Base fragment shader; OCIO function + call are injected at markers.
     _FRAG_BASE = """
-#version 130
+#version 150 core
 uniform sampler2D u_frame;
 // OCIO_INJECT
 in  vec2 v_tex;
@@ -603,14 +604,11 @@ void main() {
     def __init__(self, parent=None):
         fmt = QSurfaceFormat()
         fmt.setSwapInterval(0)
-        # macOS only provides a CoreProfile context for OpenGL 3.2+.
-        # Windows/Linux support CompatibilityProfile at 3.0 which is broader.
-        if sys.platform == "darwin":
-            fmt.setVersion(3, 2)
-            fmt.setProfile(QSurfaceFormat.CoreProfile)
-        else:
-            fmt.setVersion(3, 0)
-            fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
+        # OpenGL 3.2 Core Profile — the minimum that supports GLSL 1.50.
+        # macOS requires Core Profile for anything above 2.1.
+        # All modern Windows/Linux drivers support 3.2 Core.
+        fmt.setVersion(3, 2)
+        fmt.setProfile(QSurfaceFormat.CoreProfile)
         QSurfaceFormat.setDefaultFormat(fmt)
         super().__init__(parent)
 

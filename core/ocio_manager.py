@@ -159,7 +159,7 @@ class OCIOManager:
 
         try:
             shader_desc = OCIO.GpuShaderDesc.CreateShaderDesc(
-                language=OCIO.GPU_LANGUAGE_GLSL_1_3,
+                language=OCIO.GPU_LANGUAGE_GLSL_4_0,
                 functionName="OCIODisplay",
                 resourcePrefix="ocio_",
             )
