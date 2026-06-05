@@ -26,6 +26,7 @@ No OpenCV dependency.
 
 import sys
 import os
+import re
 import json
 import time
 import array
@@ -54,12 +55,16 @@ from PyQt5.QtGui import (
 try:
     from OpenGL.GL import (
         glClearColor, glClear, glViewport, glDrawArrays,
-        glGenTextures, glBindTexture, glTexImage2D, glTexSubImage2D,
-        glTexParameteri, glActiveTexture,
+        glGenTextures, glDeleteTextures, glBindTexture,
+        glTexImage2D, glTexSubImage2D, glTexImage3D,
+        glTexParameteri, glActiveTexture, glUniform1i,
         GL_COLOR_BUFFER_BIT, GL_TRIANGLES, GL_FLOAT,
-        GL_TEXTURE_2D, GL_RGB, GL_UNSIGNED_BYTE, GL_TEXTURE0,
+        GL_TEXTURE_2D, GL_TEXTURE_3D,
+        GL_RGB, GL_RGBA, GL_RGB16, GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT,
+        GL_TEXTURE0, GL_TEXTURE1,
         GL_LINEAR, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
         GL_CLAMP_TO_EDGE, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
+        GL_TEXTURE_WRAP_R,
     )
 except ImportError:
     raise SystemExit(
@@ -69,6 +74,7 @@ except ImportError:
 from PyQt5.QtWidgets import QStyle, QStyleOptionSlider
 
 from core import constants
+from core.ocio_manager import OCIOManager, OCIO_AVAILABLE
 
 
 # ── helpers ───────────────────────────────────────────────────────────────── #
@@ -558,69 +564,99 @@ class ScrubberSlider(QSlider):
 class VideoCanvas(QOpenGLWidget):
     """
     GPU-accelerated video display.
-    Raw RGB24 bytes are uploaded as a GL texture each frame; the GPU
-    handles all scaling and letterboxing — zero CPU scaling per frame.
+
+    Supports:
+    - 8-bit RGB24 and 16-bit rgb48le (EXR/DPX) frames
+    - Pre-allocated GPU texture pool (gpu cache) for zero-upload seeks
+    - OCIO colour-management via injected GLSL function + LUT textures
     """
 
     zoom_scrolled = pyqtSignal(int)       # +1 = in, -1 = out
     pan_dragged   = pyqtSignal(int, int)  # dx, dy
 
-    # GLSL 1.20 — works on both compatibility and core profiles
-    _VERT = """
-        #version 120
-        attribute vec2 a_pos;
-        attribute vec2 a_tex;
-        varying   vec2 v_tex;
-        void main() {
-            gl_Position = vec4(a_pos, 0.0, 1.0);
-            v_tex = a_tex;
-        }
-    """
-    _FRAG = """
-        #version 120
-        uniform sampler2D u_frame;
-        varying vec2 v_tex;
-        void main() {
-            gl_FragColor = texture2D(u_frame, v_tex);
-        }
-    """
+    # GLSL 1.30 — required for OCIO; OpenGL 3.0 core / compat
+    _VERT_SRC = """
+#version 130
+in  vec2 a_pos;
+in  vec2 a_tex;
+out vec2 v_tex;
+void main() {
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+    v_tex = a_tex;
+}
+"""
+    # Base fragment shader; OCIO function + call are injected at markers.
+    _FRAG_BASE = """
+#version 130
+uniform sampler2D u_frame;
+// OCIO_INJECT
+in  vec2 v_tex;
+out vec4 fragColor;
+void main() {
+    vec4 c = texture(u_frame, v_tex);
+// OCIO_CALL
+    fragColor = c;
+}
+"""
 
     def __init__(self, parent=None):
         fmt = QSurfaceFormat()
-        fmt.setSwapInterval(0)                      # no vsync — timer drives frame rate
-        fmt.setVersion(2, 1)
+        fmt.setSwapInterval(0)
+        fmt.setVersion(3, 0)
         fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
         QSurfaceFormat.setDefaultFormat(fmt)
         super().__init__(parent)
 
-        self._frame_raw = None          # bytes | None
-        self._vid_w     = 0
-        self._vid_h     = 0
-        self._zoom      = 1.0
-        self._pan_x     = 0
-        self._pan_y     = 0
-        self._dirty     = False         # True → new frame waiting to upload
-        self._drag_pos  = None
+        self._frame_raw  = None   # bytes | None  — current SDR/HDR frame
+        self._vid_w      = 0
+        self._vid_h      = 0
+        self._is_hdr     = False  # True → rgb48le (GL_UNSIGNED_SHORT)
+        self._zoom       = 1.0
+        self._pan_x      = 0
+        self._pan_y      = 0
+        self._dirty      = False
+        self._drag_pos   = None
 
         # GL objects — initialised in initializeGL
-        self._vao       = None          # QOpenGLVertexArrayObject
-        self._prog      = None          # QOpenGLShaderProgram
-        self._vbo       = None          # QOpenGLBuffer
-        self._tex_id    = None          # raw GL texture name (int)
-        self._tex_w     = 0             # dimensions of currently allocated texture
-        self._tex_h     = 0
+        self._vao        = None
+        self._prog       = None
+        self._vbo        = None
+        self._tex_id     = None   # streaming texture for set_frame()
+        self._tex_w      = 0
+        self._tex_h      = 0
+
+        # GPU texture cache
+        self._tex_pool      = []   # list[int] — pre-allocated texture IDs
+        self._tex_cache     = {}   # frame_num → tex_pool index
+        self._cache_w       = 0
+        self._cache_h       = 0
+        self._cache_is_hdr  = False
+        self._draw_tex_id   = None  # if set, paintGL binds this instead of uploading
+
+        # OCIO
+        self._ocio_enabled  = False
+        self._ocio_func_src = ""
+        self._ocio_lut_info = []   # list[(sampler_name, tex_id, is_3d)]
 
     # ── Public API ───────────────────────────────────────────────────── #
 
-    def set_frame(self, raw: bytes, vid_w: int, vid_h: int):
+    def set_frame(self, raw: bytes, vid_w: int, vid_h: int, is_hdr: bool = False):
         self._frame_raw = raw
         self._vid_w     = vid_w
         self._vid_h     = vid_h
+        self._is_hdr    = is_hdr
         self._dirty     = True
+        self._draw_tex_id = None
+        self.update()
+
+    def set_cached_frame(self, tex_id: int):
+        """Render a previously cached texture (skips CPU→GPU upload)."""
+        self._draw_tex_id = tex_id
         self.update()
 
     def clear_frame(self):
-        self._frame_raw = None
+        self._frame_raw   = None
+        self._draw_tex_id = None
         self.update()
 
     def set_transform(self, zoom: float, pan_x: int, pan_y: int):
@@ -629,34 +665,117 @@ class VideoCanvas(QOpenGLWidget):
         self._pan_y = pan_y
         self.update()
 
+    # ── GPU Texture Cache API ─────────────────────────────────────────── #
+
+    def begin_gpu_cache(self, n_frames: int, w: int, h: int, is_hdr: bool):
+        """Pre-allocate *n_frames* textures for the GPU cache (main thread only)."""
+        self.clear_gpu_cache()
+        self.makeCurrent()
+        ids = glGenTextures(n_frames)
+        if isinstance(ids, int):      # glGenTextures(1) returns a scalar
+            ids = [ids]
+        for tid in ids:
+            self._alloc_texture(int(tid), w, h, is_hdr)
+        self._tex_pool     = [int(t) for t in ids]
+        self._cache_w      = w
+        self._cache_h      = h
+        self._cache_is_hdr = is_hdr
+
+    def upload_gpu_frame(self, frame_num: int, raw: bytes):
+        """Upload *raw* into the pool slot for *frame_num* (main thread only)."""
+        if frame_num >= len(self._tex_pool):
+            return
+        tid = self._tex_pool[frame_num]
+        self.makeCurrent()
+        glBindTexture(GL_TEXTURE_2D, tid)
+        if self._cache_is_hdr:
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                            self._cache_w, self._cache_h,
+                            GL_RGB, GL_UNSIGNED_SHORT, raw)
+        else:
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                            self._cache_w, self._cache_h,
+                            GL_RGB, GL_UNSIGNED_BYTE, raw)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        self._tex_cache[frame_num] = tid
+
+    def get_cached_tex(self, frame_num: int):
+        """Return cached GL texture ID for *frame_num*, or None."""
+        return self._tex_cache.get(frame_num)
+
+    def clear_gpu_cache(self):
+        """Release all pooled GPU textures."""
+        if not self._tex_pool:
+            return
+        self.makeCurrent()
+        glDeleteTextures(len(self._tex_pool), self._tex_pool)
+        self._tex_pool  = []
+        self._tex_cache = {}
+
+    # ── OCIO API ─────────────────────────────────────────────────────── #
+
+    def set_ocio(self, func_src: str, lut_list: list):
+        """
+        Install an OCIO colour transform.
+        *lut_list* items: (sampler_name, width, height, data_bytes, is_3d)
+        """
+        self.disable_ocio()
+        self.makeCurrent()
+
+        lut_info = []
+        for i, (sampler, w, h, data, is_3d) in enumerate(lut_list):
+            tid = int(glGenTextures(1))
+            if is_3d:
+                glBindTexture(GL_TEXTURE_3D, tid)
+                glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)
+                glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA, w, h, h, 0,
+                             GL_RGBA, GL_FLOAT, data)
+                glBindTexture(GL_TEXTURE_3D, 0)
+            else:
+                glBindTexture(GL_TEXTURE_2D, tid)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                             GL_RGBA, GL_FLOAT, data)
+                glBindTexture(GL_TEXTURE_2D, 0)
+            lut_info.append((sampler, tid, is_3d))
+
+        self._ocio_lut_info = lut_info
+        self._ocio_func_src = func_src
+        self._ocio_enabled  = True
+        self._rebuild_shader()
+
+    def disable_ocio(self):
+        if not self._ocio_enabled and not self._ocio_lut_info:
+            return
+        self.makeCurrent()
+        for _sampler, tid, _is_3d in self._ocio_lut_info:
+            glDeleteTextures(1, [tid])
+        self._ocio_lut_info = []
+        self._ocio_func_src = ""
+        self._ocio_enabled  = False
+        self._rebuild_shader()
+
     # ── OpenGL callbacks ─────────────────────────────────────────────── #
 
     def initializeGL(self):
-        # VAO — required in core profile; harmless in compatibility profile
         self._vao = QOpenGLVertexArrayObject(self)
         self._vao.create()
-
-        self._prog = QOpenGLShaderProgram(self)
-        self._prog.addShaderFromSourceCode(QOpenGLShader.Vertex,   self._VERT)
-        self._prog.addShaderFromSourceCode(QOpenGLShader.Fragment, self._FRAG)
-        self._prog.bindAttributeLocation("a_pos", 0)
-        self._prog.bindAttributeLocation("a_tex", 1)
-        if not self._prog.link():
-            print(f"[BlastPlayer] GL link error: {self._prog.log()}")
 
         self._vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
         self._vbo.create()
         self._vbo.setUsagePattern(QOpenGLBuffer.DynamicDraw)
 
-        # Raw GL texture (glTexImage2D/glTexSubImage2D for clean size-change handling)
         self._tex_id = int(glGenTextures(1))
-        glBindTexture(GL_TEXTURE_2D, self._tex_id)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-        glBindTexture(GL_TEXTURE_2D, 0)
+        self._alloc_texture(self._tex_id, 0, 0, False)
 
+        self._rebuild_shader()
         glClearColor(0, 0, 0, 1)
 
     def resizeGL(self, w: int, h: int):
@@ -665,24 +784,36 @@ class VideoCanvas(QOpenGLWidget):
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT)
 
-        if not self._frame_raw or not self._vid_w or self._prog is None:
+        have_cached = self._draw_tex_id is not None
+        if not have_cached and (not self._frame_raw or not self._vid_w):
+            return
+        if self._prog is None:
             return
 
-        # Upload new frame bytes to the GPU texture
-        if self._dirty:
-            w, h = self._vid_w, self._vid_h
-            glBindTexture(GL_TEXTURE_2D, self._tex_id)
-            if w != self._tex_w or h != self._tex_h:
-                # First frame or resolution change: allocate new storage
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0,
-                             GL_RGB, GL_UNSIGNED_BYTE, self._frame_raw)
-                self._tex_w, self._tex_h = w, h
-            else:
-                # Same size: update in-place (much faster than reallocating)
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
-                                GL_RGB, GL_UNSIGNED_BYTE, self._frame_raw)
-            glBindTexture(GL_TEXTURE_2D, 0)
-            self._dirty = False
+        # ── Determine which texture to render ────────────────────────── #
+        if have_cached:
+            render_tex = self._draw_tex_id
+            self._draw_tex_id = None
+        else:
+            render_tex = self._tex_id
+            if self._dirty:
+                w, h = self._vid_w, self._vid_h
+                glBindTexture(GL_TEXTURE_2D, render_tex)
+                if self._is_hdr:
+                    int_fmt, gl_type = GL_RGB16, GL_UNSIGNED_SHORT
+                else:
+                    int_fmt, gl_type = GL_RGB, GL_UNSIGNED_BYTE
+                if w != self._tex_w or h != self._tex_h or self._is_hdr != getattr(self, '_tex_hdr', False):
+                    glTexImage2D(GL_TEXTURE_2D, 0, int_fmt, w, h, 0,
+                                 GL_RGB, gl_type, self._frame_raw)
+                    self._tex_w   = w
+                    self._tex_h   = h
+                    self._tex_hdr = self._is_hdr
+                else:
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                                    GL_RGB, gl_type, self._frame_raw)
+                glBindTexture(GL_TEXTURE_2D, 0)
+                self._dirty = False
 
         verts = self._quad_vertices()
         if not verts:
@@ -696,11 +827,24 @@ class VideoCanvas(QOpenGLWidget):
         self._vbo.allocate(raw, len(raw))
 
         self._prog.bind()
+
+        # Frame texture → unit 0
         glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D, self._tex_id)
+        glBindTexture(GL_TEXTURE_2D, render_tex)
         self._prog.setUniformValue("u_frame", 0)
 
-        stride = 4 * 4                  # 4 floats × 4 bytes
+        # OCIO LUT textures → units 1, 2, …
+        if self._ocio_enabled:
+            for i, (sampler, tid, is_3d) in enumerate(self._ocio_lut_info):
+                unit = GL_TEXTURE1 + i
+                glActiveTexture(unit)
+                target = GL_TEXTURE_3D if is_3d else GL_TEXTURE_2D
+                glBindTexture(target, tid)
+                loc = self._prog.uniformLocation(sampler)
+                if loc >= 0:
+                    glUniform1i(loc, i + 1)
+
+        stride = 4 * 4          # 4 floats × 4 bytes
         self._prog.enableAttributeArray(0)
         self._prog.enableAttributeArray(1)
         self._prog.setAttributeBuffer(0, GL_FLOAT, 0,     2, stride)
@@ -710,15 +854,66 @@ class VideoCanvas(QOpenGLWidget):
 
         self._prog.disableAttributeArray(0)
         self._prog.disableAttributeArray(1)
+        glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, 0)
         self._prog.release()
         self._vbo.release()
         self._vao.release()
 
+    # ── Shader compilation ────────────────────────────────────────────── #
+
+    def _rebuild_shader(self):
+        """Compile/relink the shader program with optional OCIO injection."""
+        if self._ocio_enabled and self._ocio_func_src:
+            frag = self._FRAG_BASE.replace(
+                "// OCIO_INJECT", self._ocio_func_src
+            ).replace(
+                "// OCIO_CALL", "    c = OCIODisplay(c);"
+            )
+            # Add LUT sampler uniforms after the injection point
+            extra_uniforms = "\n".join(
+                f"uniform {'sampler3D' if is_3d else 'sampler2D'} {sampler};"
+                for sampler, _tid, is_3d in self._ocio_lut_info
+            )
+            frag = frag.replace("// OCIO_INJECT", extra_uniforms + "\n// OCIO_INJECT", 1)
+        else:
+            frag = self._FRAG_BASE.replace(
+                "// OCIO_INJECT", ""
+            ).replace(
+                "// OCIO_CALL", ""
+            )
+
+        prog = QOpenGLShaderProgram(self)
+        prog.addShaderFromSourceCode(QOpenGLShader.Vertex,   self._VERT_SRC)
+        prog.addShaderFromSourceCode(QOpenGLShader.Fragment, frag)
+        prog.bindAttributeLocation("a_pos", 0)
+        prog.bindAttributeLocation("a_tex", 1)
+        if not prog.link():
+            print(f"[BlastPlayer] shader link error: {prog.log()}")
+            return
+        self._prog = prog
+
+    # ── Texture helpers ───────────────────────────────────────────────── #
+
+    @staticmethod
+    def _alloc_texture(tid: int, w: int, h: int, is_hdr: bool):
+        glBindTexture(GL_TEXTURE_2D, tid)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        if w > 0 and h > 0:
+            if is_hdr:
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16, w, h, 0,
+                             GL_RGB, GL_UNSIGNED_SHORT, None)
+            else:
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0,
+                             GL_RGB, GL_UNSIGNED_BYTE, None)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
     # ── Quad geometry ────────────────────────────────────────────────── #
 
     def _quad_vertices(self):
-        """24 floats: 6 × (x, y, u, v) describing the letterboxed video quad."""
         vw, vh = self.width(), self.height()
         if vw == 0 or vh == 0 or self._vid_w == 0 or self._vid_h == 0:
             return []
@@ -732,7 +927,7 @@ class VideoCanvas(QOpenGLWidget):
             else:
                 sx, sy = vid_ar / view_ar, 1.0
             x0, x1 = -sx, sx
-            y0, y1 = -sy, sy            # NDC: y0 = bottom, y1 = top
+            y0, y1 = -sy, sy
             u0, u1, v0, v1 = 0.0, 1.0, 0.0, 1.0
         else:
             x0, x1, y0, y1 = -1.0, 1.0, -1.0, 1.0
@@ -742,17 +937,16 @@ class VideoCanvas(QOpenGLWidget):
             disp_h = self._vid_h * total
             px = max(0.0, min(float(self._pan_x), max(0.0, disp_w - vw)))
             py = max(0.0, min(float(self._pan_y), max(0.0, disp_h - vh)))
-            u0 = px / disp_w;           u1 = min(1.0, (px + vw) / disp_w)
-            v0 = py / disp_h;           v1 = min(1.0, (py + vh) / disp_h)
+            u0 = px / disp_w;  u1 = min(1.0, (px + vw) / disp_w)
+            v0 = py / disp_h;  v1 = min(1.0, (py + vh) / disp_h)
 
-        # Two triangles; v0 = image-top → NDC-top (y1), v1 = image-bottom → NDC-bottom (y0)
         return [
-            x0, y1, u0, v0,   # top-left
-            x1, y1, u1, v0,   # top-right
-            x1, y0, u1, v1,   # bottom-right
-            x0, y1, u0, v0,   # top-left
-            x1, y0, u1, v1,   # bottom-right
-            x0, y0, u0, v1,   # bottom-left
+            x0, y1, u0, v0,
+            x1, y1, u1, v0,
+            x1, y0, u1, v1,
+            x0, y1, u0, v0,
+            x1, y0, u1, v1,
+            x0, y0, u0, v1,
         ]
 
     # ── Mouse / wheel ────────────────────────────────────────────────── #
@@ -807,9 +1001,10 @@ class PlayerWidget(QWidget):
                 ←/→  step frame       Home/End  first/last
     """
 
-    _SPEEDS       = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
-    _SPEED_LABELS = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
-    _CACHE_MAX_MB = 2048   # skip RAM cache if decoded frames exceed this
+    _SPEEDS             = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+    _SPEED_LABELS       = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
+    _CACHE_MAX_MB       = 2048   # skip CPU RAM cache if decoded frames exceed this
+    _PREFETCH_QUEUE_SIZE = 16    # frames buffered ahead in the pipe reader thread
 
     video_ended = pyqtSignal()   # emitted when video reaches end without looping
 
@@ -823,6 +1018,11 @@ class PlayerWidget(QWidget):
         self._total_frames    = 0
         self._vid_w           = 0
         self._vid_h           = 0        # native dimensions (pre-transform)
+
+        # HDR / pixel format
+        self._is_hdr          = False    # True for EXR / DPX
+        self._pix_fmt         = "rgb24"  # ffmpeg -pix_fmt value
+        self._bytes_per_pixel = 3        # 3 for rgb24, 6 for rgb48le
 
         # Playback state
         self._current_frame   = 0
@@ -841,9 +1041,16 @@ class PlayerWidget(QWidget):
         self._play_frame_start = 0      # _current_frame when playback (re)started
 
         # Pipe reader thread — keeps pipe reads off the main thread
-        self._frame_queue   = queue.Queue(maxsize=4)
+        self._frame_queue   = queue.Queue(maxsize=self._PREFETCH_QUEUE_SIZE)
         self._reader_thread = None
         self._reader_stop   = threading.Event()
+
+        # Scrub-ahead pipe — pre-warmed while user drags scrubber
+        self._scrub_pipe_proc   = None
+        self._scrub_pipe_queue  = None
+        self._scrub_pipe_thread = None
+        self._scrub_pipe_stop   = threading.Event()
+        self._scrub_pipe_frame  = -1   # target frame the scrub pipe is primed for
 
         # Pre-warmed loop pipe — opened N frames before EOF for seamless looping
         self._loop_pipe_proc   = None
@@ -854,6 +1061,10 @@ class PlayerWidget(QWidget):
         # RAM frame cache — all frames decoded into memory for zero-latency playback
         self._frame_cache   = None   # list[bytes] once ready, None while not cached
         self._cache_loading = False  # True while background decode is running
+
+        # GPU texture cache — frames uploaded to VideoCanvas texture pool
+        self._gpu_cache_ready   = False
+        self._gpu_upload_idx    = 0
 
         # Reverse frame cache
         self._reverse_cache   = []      # list of (frame_num, raw_bytes), pop() = backward
@@ -887,6 +1098,12 @@ class PlayerWidget(QWidget):
         self._scrub_debounce = QTimer(self)
         self._scrub_debounce.setSingleShot(True)
         self._scrub_debounce.timeout.connect(self._play_scrub_audio)
+
+        # Scrub-ahead seek debounce — pre-warms ffmpeg pipe at drag target
+        self._scrub_seek_debounce = QTimer(self)
+        self._scrub_seek_debounce.setSingleShot(True)
+        self._scrub_seek_debounce.timeout.connect(
+            lambda: self._prime_scrub_pipe(self._scrubber.value()))
 
         # Misc state
         self._scrubber_moving = False
@@ -925,6 +1142,10 @@ class PlayerWidget(QWidget):
         self._vid_h        = info["height"]
         self._current_frame = 0
 
+        self._is_hdr          = self._detect_hdr(path)
+        self._pix_fmt         = "rgb48le" if self._is_hdr else "rgb24"
+        self._bytes_per_pixel = 6        if self._is_hdr else 3
+
         self._scrubber.blockSignals(True)
         self._scrubber.setRange(0, max(self._total_frames - 1, 0))
         self._scrubber.setValue(0)
@@ -944,6 +1165,26 @@ class PlayerWidget(QWidget):
 
     def stop(self):
         self._cleanup()
+
+    # ------------------------------------------------------------------ #
+    #  EXR / HDR helpers                                                   #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _detect_hdr(path: str) -> bool:
+        return Path(path).suffix.lower() in constants.EXR_EXTS
+
+    @staticmethod
+    def _exr_seq_pattern(path: str) -> str:
+        """Convert frame_0001.exr → frame_%04d.exr for ffmpeg -i."""
+        m = re.search(r'(\d+)(\.[^.]+)$', path)
+        if m:
+            return path[:m.start(1)] + f"%0{len(m.group(1))}d" + m.group(2)
+        return path
+
+    def _frame_nbytes(self) -> int:
+        w, h = self._effective_size()
+        return w * h * self._bytes_per_pixel
 
     # ------------------------------------------------------------------ #
     #  In / Out points                                                     #
@@ -1046,13 +1287,17 @@ class PlayerWidget(QWidget):
     def _open_mc_next_pipe(self, clip: dict):
         """Start decoding the next clip's frames in the background so adoption is instant."""
         self._close_mc_next_pipe()
-        w, h   = clip['width'], clip['height']
-        nbytes = w * h * 3
+        w, h     = clip['width'], clip['height']
+        is_hdr   = self._detect_hdr(clip['path'])
+        pix_fmt  = "rgb48le" if is_hdr else "rgb24"
+        bpp      = 6 if is_hdr else 3
+        nbytes   = w * h * bpp
+        src      = self._exr_seq_pattern(clip['path']) if is_hdr else clip['path']
         cmd = [
             _ffmpeg_exe(),
-            "-i",       clip['path'],
+            "-i",       src,
             "-f",       "rawvideo",
-            "-pix_fmt", "rgb24",
+            "-pix_fmt", pix_fmt,
             "-vf",      "null",
             "pipe:1",
         ]
@@ -1060,7 +1305,7 @@ class PlayerWidget(QWidget):
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self._mc_next_proc  = proc
             self._mc_next_stop.clear()
-            self._mc_next_queue = queue.Queue(maxsize=4)
+            self._mc_next_queue = queue.Queue(maxsize=self._PREFETCH_QUEUE_SIZE)
             q    = self._mc_next_queue
             stop = self._mc_next_stop
             def _read():
@@ -1123,6 +1368,11 @@ class PlayerWidget(QWidget):
         self._loop_frame0      = None
         self._frame_cache      = None
         self._cache_loading    = False
+        self._gpu_cache_ready  = False
+        self._gpu_upload_idx   = 0
+        self._is_hdr           = self._detect_hdr(clip['path'])
+        self._pix_fmt          = "rgb48le" if self._is_hdr else "rgb24"
+        self._bytes_per_pixel  = 6         if self._is_hdr else 3
         self._play_frame_start = 0
         self._play_clock_start = time.monotonic()
         self._play_btn.setIcon(_icon("pause.png"))
@@ -1190,21 +1440,20 @@ class PlayerWidget(QWidget):
     def _fetch_frame(self, frame_num: int) -> bytes | None:
         """
         Accurate single-frame decode via ffmpeg (post-input -ss).
-        Returns raw RGB24 bytes or None on failure.
-        Uses post-input seek so every frame is reachable, not just keyframes.
-        This is slower than the pipe but only used for stepping/scrubbing/reverse.
+        Returns raw bytes (RGB24 or rgb48le) or None on failure.
         """
         if not self._path or not self._vid_w:
             return None
         seek = frame_num / self._fps
         w, h = self._effective_size()
+        src  = self._exr_seq_pattern(self._path) if self._is_hdr else self._path
         cmd = [
             _ffmpeg_exe(),
-            "-i",        self._path,
+            "-i",        src,
             "-ss",       f"{seek:.6f}",
             "-frames:v", "1",
             "-f",        "rawvideo",
-            "-pix_fmt",  "rgb24",
+            "-pix_fmt",  self._pix_fmt,
             "-vf",       self._build_vf(),
             "pipe:1",
         ]
@@ -1212,8 +1461,8 @@ class PlayerWidget(QWidget):
             proc = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
-            raw = proc.stdout
-            expected = w * h * 3
+            raw      = proc.stdout
+            expected = w * h * self._bytes_per_pixel
             return raw if len(raw) == expected else None
         except Exception as exc:
             print(f"[BlastPlayer] fetch_frame: {exc}")
@@ -1245,14 +1494,15 @@ class PlayerWidget(QWidget):
         pre_ts            = pre_frame / self._fps
         fine_ts           = pre_offset_frames / self._fps
 
+        src = self._exr_seq_pattern(self._path) if self._is_hdr else self._path
         cmd = [_ffmpeg_exe()]
         if pre_ts > 0:
             cmd += ["-ss", f"{pre_ts:.6f}"]
         cmd += [
-            "-i",       self._path,
+            "-i",       src,
             "-ss",      f"{fine_ts:.6f}",
             "-f",       "rawvideo",
-            "-pix_fmt", "rgb24",
+            "-pix_fmt", self._pix_fmt,
             "-vf",      self._build_vf(),
             "pipe:1",
         ]
@@ -1298,25 +1548,26 @@ class PlayerWidget(QWidget):
         """
         if not self._path or not self._vid_w or self._total_frames <= 0:
             return
-        w, h       = self._effective_size()
-        frame_size = w * h * 3
+        frame_size = self._frame_nbytes()
         total_mb   = (self._total_frames * frame_size) / 1_048_576
         if total_mb > self._CACHE_MAX_MB:
             return
 
         self._frame_cache   = None
         self._cache_loading = True
-        path   = self._path
-        vf     = self._build_vf()
-        nf     = self._total_frames
-        nbytes = frame_size
+        path    = self._path
+        pix_fmt = self._pix_fmt
+        src     = self._exr_seq_pattern(path) if self._is_hdr else path
+        vf      = self._build_vf()
+        nf      = self._total_frames
+        nbytes  = frame_size
 
         def _fill():
             cmd = [
                 _ffmpeg_exe(),
-                "-i",       path,
+                "-i",       src,
                 "-f",       "rawvideo",
-                "-pix_fmt", "rgb24",
+                "-pix_fmt", pix_fmt,
                 "-vf",      vf,
                 "pipe:1",
             ]
@@ -1341,6 +1592,7 @@ class PlayerWidget(QWidget):
             if frames:
                 self._frame_cache = frames
             self._cache_loading = False
+            QTimer.singleShot(0, self._start_gpu_cache_build)
 
         threading.Thread(target=_fill, daemon=True).start()
 
@@ -1349,12 +1601,13 @@ class PlayerWidget(QWidget):
         if self._loop_pipe_proc is not None or not self._path or not self._vid_w:
             return
         self._loop_reader_stop.clear()
-        self._loop_pipe_queue = queue.Queue(maxsize=4)
+        self._loop_pipe_queue = queue.Queue(maxsize=self._PREFETCH_QUEUE_SIZE)
+        src = self._exr_seq_pattern(self._path) if self._is_hdr else self._path
         cmd = [
             _ffmpeg_exe(),
-            "-i",       self._path,
+            "-i",       src,
             "-f",       "rawvideo",
-            "-pix_fmt", "rgb24",
+            "-pix_fmt", self._pix_fmt,
             "-vf",      self._build_vf(),
             "pipe:1",
         ]
@@ -1394,7 +1647,7 @@ class PlayerWidget(QWidget):
 
     def _start_reader_thread(self):
         self._reader_stop.clear()
-        self._frame_queue = queue.Queue(maxsize=4)
+        self._frame_queue = queue.Queue(maxsize=self._PREFETCH_QUEUE_SIZE)
         proc = self._pipe_proc
         q    = self._frame_queue
         stop = self._reader_stop
@@ -1416,8 +1669,7 @@ class PlayerWidget(QWidget):
 
     def _pipe_reader_loop(self, proc, q, stop):
         """Background: reads frames from proc and puts them into q."""
-        w, h   = self._effective_size()
-        nbytes = w * h * 3
+        nbytes = self._frame_nbytes()
         while not stop.is_set():
             try:
                 raw = proc.stdout.read(nbytes)
@@ -1447,10 +1699,10 @@ class PlayerWidget(QWidget):
         self._timer.stop()          # pause ticking while we fill
 
         start_frame = max(0, up_to_frame - self._REVERSE_BATCH + 1)
-        w, h        = self._effective_size()
-        nbytes      = w * h * 3
+        nbytes      = self._frame_nbytes()
         n_frames    = up_to_frame - start_frame + 1
         path        = self._path
+        pix_fmt     = self._pix_fmt
         vf          = self._build_vf()
 
         def _fill():
@@ -1467,7 +1719,7 @@ class PlayerWidget(QWidget):
                 "-ss",       f"{fine_ts:.6f}",
                 "-frames:v", str(n_frames),
                 "-f",        "rawvideo",
-                "-pix_fmt",  "rgb24",
+                "-pix_fmt",  pix_fmt,
                 "-vf",       vf,
                 "pipe:1",
             ]
@@ -1499,6 +1751,117 @@ class PlayerWidget(QWidget):
         if self._is_playing and self._play_reverse and self._reverse_cache:
             interval = max(1, int(1000 / (self._fps * self._speed)))
             self._timer.start(interval)
+
+    # ------------------------------------------------------------------ #
+    #  Scrub-ahead pipe                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _prime_scrub_pipe(self, frame_num: int):
+        """Open a background ffmpeg pipe at *frame_num* for instant scrub-release."""
+        if not self._path or not self._vid_w:
+            return
+        self._close_scrub_pipe()
+        nbytes = self._frame_nbytes()
+        src    = self._exr_seq_pattern(self._path) if self._is_hdr else self._path
+
+        pre_offset_frames = min(frame_num, int(self._fps * 4))
+        pre_frame = frame_num - pre_offset_frames
+        pre_ts    = pre_frame / self._fps
+        fine_ts   = pre_offset_frames / self._fps
+
+        cmd = [_ffmpeg_exe()]
+        if pre_ts > 0:
+            cmd += ["-ss", f"{pre_ts:.6f}"]
+        cmd += [
+            "-i",       src,
+            "-ss",      f"{fine_ts:.6f}",
+            "-f",       "rawvideo",
+            "-pix_fmt", self._pix_fmt,
+            "-vf",      self._build_vf(),
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            self._scrub_pipe_proc   = proc
+            self._scrub_pipe_frame  = frame_num
+            self._scrub_pipe_stop.clear()
+            self._scrub_pipe_queue  = queue.Queue(maxsize=8)
+            q    = self._scrub_pipe_queue
+            stop = self._scrub_pipe_stop
+
+            def _read():
+                while not stop.is_set():
+                    try:
+                        raw = proc.stdout.read(nbytes)
+                    except Exception:
+                        break
+                    if len(raw) < nbytes:
+                        try: q.put(None, timeout=1.0)
+                        except queue.Full: pass
+                        break
+                    try:
+                        q.put(bytes(raw))
+                    except Exception:
+                        break
+
+            self._scrub_pipe_thread = threading.Thread(target=_read, daemon=True)
+            self._scrub_pipe_thread.start()
+        except Exception as exc:
+            print(f"[BlastPlayer] scrub pipe: {exc}")
+            self._scrub_pipe_proc = None
+
+    def _close_scrub_pipe(self):
+        self._scrub_pipe_stop.set()
+        self._scrub_pipe_thread = None
+        if self._scrub_pipe_proc is not None:
+            try:
+                self._scrub_pipe_proc.stdout.close()
+                self._scrub_pipe_proc.terminate()
+            except Exception:
+                pass
+            self._scrub_pipe_proc = None
+        if self._scrub_pipe_queue is not None:
+            while True:
+                try: self._scrub_pipe_queue.get_nowait()
+                except queue.Empty: break
+            self._scrub_pipe_queue = None
+        self._scrub_pipe_stop.clear()
+        self._scrub_pipe_frame = -1
+
+    # ------------------------------------------------------------------ #
+    #  GPU Texture Cache                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _start_gpu_cache_build(self):
+        """Upload CPU frame cache to GPU textures in batches (main thread only)."""
+        if not self._frame_cache or not self._vid_w:
+            return
+        w, h = self._effective_size()
+        bpp  = self._bytes_per_pixel
+        max_frames = min(
+            len(self._frame_cache),
+            (constants.GPU_CACHE_MAX_MB * 1_048_576) // max(1, w * h * bpp),
+        )
+        if max_frames <= 0:
+            return
+        self._gpu_cache_ready = False
+        self._gpu_upload_idx  = 0
+        self._canvas.begin_gpu_cache(max_frames, w, h, self._is_hdr)
+        QTimer.singleShot(0, self._gpu_upload_batch)
+
+    def _gpu_upload_batch(self):
+        if not self._frame_cache:
+            return
+        pool_size = len(self._canvas._tex_pool)
+        for _ in range(8):
+            idx = self._gpu_upload_idx
+            if idx >= len(self._frame_cache) or idx >= pool_size:
+                self._gpu_cache_ready = True
+                return
+            self._canvas.upload_gpu_frame(idx, self._frame_cache[idx])
+            self._gpu_upload_idx += 1
+        QTimer.singleShot(0, self._gpu_upload_batch)
 
     # ------------------------------------------------------------------ #
     #  UI                                                                  #
@@ -2024,11 +2387,15 @@ class PlayerWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def _render_raw(self, raw: bytes):
-        """Upload raw RGB24 bytes to the GL canvas."""
         w, h = self._effective_size()
-        if w == 0 or h == 0:
+        if not w or not h:
             return
-        self._canvas.set_frame(raw, w, h)
+        if self._gpu_cache_ready:
+            tex = self._canvas.get_cached_tex(self._current_frame)
+            if tex is not None:
+                self._canvas.set_cached_frame(tex)
+                return
+        self._canvas.set_frame(raw, w, h, is_hdr=self._is_hdr)
 
     def _refresh_display(self):
         """Push current zoom/pan state to the GL canvas."""
@@ -2090,21 +2457,40 @@ class PlayerWidget(QWidget):
                 self._update_info()
             return
 
-        # Single-clip mode — original behaviour
+        # Single-clip mode
+        self._scrub_seek_debounce.stop()
         self._current_frame = global_val
         if self._is_playing:
             self._stop_audio()
             if self._play_reverse:
                 self._reverse_cache = []
+                self._close_scrub_pipe()
             elif self._frame_cache is not None:
                 self._pipe_frame = self._current_frame
+                self._close_scrub_pipe()
+            elif (self._scrub_pipe_proc is not None
+                    and self._scrub_pipe_frame == global_val):
+                # Adopt the pre-warmed scrub pipe — no ffmpeg startup wait
+                self._close_pipe()
+                self._pipe_proc     = self._scrub_pipe_proc
+                self._frame_queue   = self._scrub_pipe_queue
+                self._reader_thread = self._scrub_pipe_thread
+                self._reader_stop   = self._scrub_pipe_stop
+                self._pipe_frame    = global_val
+                self._scrub_pipe_proc   = None
+                self._scrub_pipe_queue  = None
+                self._scrub_pipe_thread = None
+                self._scrub_pipe_stop   = threading.Event()
+                self._scrub_pipe_frame  = -1
             else:
+                self._close_scrub_pipe()
                 self._open_pipe(self._current_frame)
             self._play_frame_start = self._current_frame
             self._play_clock_start = time.monotonic()
             self._start_audio()
             self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
         else:
+            self._close_scrub_pipe()
             self._show_frame(self._current_frame)
             self._update_info()
 
@@ -2137,6 +2523,8 @@ class PlayerWidget(QWidget):
         self._update_info()
         if self._audio_scrub_enabled:
             self._scrub_debounce.start(80)
+        if not self._play_reverse and not self._frame_cache:
+            self._scrub_seek_debounce.start(120)
 
     # ------------------------------------------------------------------ #
     #  Speed / loop                                                        #
@@ -2445,6 +2833,7 @@ class PlayerWidget(QWidget):
         self._close_pipe()
         self._close_loop_pipe()
         self._close_lookahead()
+        self._close_scrub_pipe()
         self._stop_audio()
         self._path             = ""
         self._current_frame    = 0
@@ -2454,6 +2843,11 @@ class PlayerWidget(QWidget):
         self._loop_frame0      = None
         self._frame_cache      = None
         self._cache_loading    = False
+        self._gpu_cache_ready  = False
+        self._gpu_upload_idx   = 0
+        self._is_hdr           = False
+        self._pix_fmt          = "rgb24"
+        self._bytes_per_pixel  = 3
         self._play_clock_start = 0.0
         self._play_frame_start = 0
         self._stop_mc_audio()
@@ -2465,6 +2859,7 @@ class PlayerWidget(QWidget):
         self._scrubber.set_in_out(None, None)
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
+        self._canvas.clear_gpu_cache()
         self._canvas.clear_frame()
 
     # ------------------------------------------------------------------ #
@@ -2541,6 +2936,7 @@ class BlastPlayerWindow(QMainWindow):
         self._player  = PlayerWidget(self)
         self._welcome = WelcomeWidget(self)
         self._current_filename = ""
+        self._ocio    = OCIOManager()
 
         self._player.set_frame_callback(self._update_title)
 
@@ -2666,6 +3062,23 @@ class BlastPlayerWindow(QMainWindow):
         self._scrub_act.setCheckable(True)
         self._scrub_act.triggered.connect(
             lambda checked: setattr(self._player, "_audio_scrub_enabled", checked))
+
+        # Color (OCIO)
+        cm = mb.addMenu("Color")
+        load_ocio_act = cm.addAction("Load OCIO Config…")
+        load_ocio_act.triggered.connect(self._on_load_ocio_config)
+        cm.addSeparator()
+        self._ocio_src_menu  = cm.addMenu("Input Color Space")
+        self._ocio_disp_menu = cm.addMenu("Display")
+        self._ocio_view_menu = cm.addMenu("View")
+        cm.addSeparator()
+        self._ocio_enable_act = cm.addAction("Enable Color Management")
+        self._ocio_enable_act.setCheckable(True)
+        self._ocio_enable_act.setShortcut("Ctrl+Shift+C")
+        self._ocio_enable_act.triggered.connect(self._on_ocio_toggled)
+        if not OCIO_AVAILABLE:
+            cm.setEnabled(False)
+            cm.setTitle("Color  (install opencolorio)")
 
         # Video
         vm = mb.addMenu("Video")
@@ -2830,6 +3243,88 @@ class BlastPlayerWindow(QMainWindow):
             self, "Open video", "", f"Video files ({exts});;All files (*)")
         if path:
             self.open_video(path)
+
+    # ------------------------------------------------------------------ #
+    #  OCIO                                                                #
+    # ------------------------------------------------------------------ #
+
+    def _on_load_ocio_config(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load OCIO Config", "", "OCIO Config (*.ocio);;All files (*)")
+        if not path:
+            return
+        if not self._ocio.load_config(path):
+            QMessageBox.warning(self, "OCIO", f"Failed to load config:\n{path}")
+            return
+        self._rebuild_ocio_menus()
+
+    def _rebuild_ocio_menus(self):
+        """Repopulate Input CS / Display / View submenus from the loaded config."""
+        sg_src  = QActionGroup(self); sg_src.setExclusive(True)
+        sg_disp = QActionGroup(self); sg_disp.setExclusive(True)
+        sg_view = QActionGroup(self); sg_view.setExclusive(True)
+
+        self._ocio_src_menu.clear()
+        for cs in self._ocio.get_input_color_spaces():
+            a = self._ocio_src_menu.addAction(cs)
+            a.setCheckable(True)
+            a.setChecked(cs == self._ocio.current_src_cs())
+            sg_src.addAction(a)
+            a.triggered.connect(lambda _, c=cs: self._on_ocio_src_changed(c))
+
+        self._ocio_disp_menu.clear()
+        for disp in self._ocio.get_displays():
+            a = self._ocio_disp_menu.addAction(disp)
+            a.setCheckable(True)
+            a.setChecked(disp == self._ocio.current_display())
+            sg_disp.addAction(a)
+            a.triggered.connect(lambda _, d=disp: self._on_ocio_disp_changed(d))
+
+        self._rebuild_ocio_view_menu()
+
+    def _rebuild_ocio_view_menu(self):
+        sg_view = QActionGroup(self); sg_view.setExclusive(True)
+        self._ocio_view_menu.clear()
+        for view in self._ocio.get_views(self._ocio.current_display()):
+            a = self._ocio_view_menu.addAction(view)
+            a.setCheckable(True)
+            a.setChecked(view == self._ocio.current_view())
+            sg_view.addAction(a)
+            a.triggered.connect(lambda _, v=view: self._on_ocio_view_changed(v))
+
+    def _on_ocio_src_changed(self, cs: str):
+        self._ocio.set_transform(cs, self._ocio.current_display(),
+                                 self._ocio.current_view())
+        if self._ocio_enable_act.isChecked():
+            self._apply_ocio()
+
+    def _on_ocio_disp_changed(self, disp: str):
+        self._ocio.set_transform(self._ocio.current_src_cs(), disp,
+                                 self._ocio.current_view())
+        self._rebuild_ocio_view_menu()
+        if self._ocio_enable_act.isChecked():
+            self._apply_ocio()
+
+    def _on_ocio_view_changed(self, view: str):
+        self._ocio.set_transform(self._ocio.current_src_cs(),
+                                 self._ocio.current_display(), view)
+        if self._ocio_enable_act.isChecked():
+            self._apply_ocio()
+
+    def _on_ocio_toggled(self, checked: bool):
+        if checked:
+            self._apply_ocio()
+        else:
+            self._player._canvas.disable_ocio()
+
+    def _apply_ocio(self):
+        func_src, luts = self._ocio.build_gpu_shader()
+        if func_src:
+            self._player._canvas.set_ocio(func_src, luts)
+        else:
+            self._ocio_enable_act.setChecked(False)
+            QMessageBox.warning(self, "OCIO",
+                "Could not build GPU shader — check config and transform selection.")
 
     # ------------------------------------------------------------------ #
     #  Drag & drop                                                         #

@@ -12,7 +12,8 @@ TEXT_SEC       = "#a1a1a1"
 SPLITTER_COLOR = "#292929"
 
 # ── Supported video extensions ──────────────────────────────────────────────
-VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm"}
+EXR_EXTS   = {".exr", ".dpx"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm"} | EXR_EXTS
 
 # ── FFmpeg / ffplay path detection ──────────────────────────────────────────
 if _sys.platform == "win32":
@@ -45,6 +46,12 @@ def _find_ffmpeg() -> str:
 
 
 FFMPEG_PATH = _find_ffmpeg()
+
+# ── GPU texture cache ───────────────────────────────────────────────────────
+GPU_CACHE_MAX_MB = 1024   # maximum GPU texture pool size in MiB
+
+# ── OpenColorIO ──────────────────────────────────────────────────────────────
+OCIO_CONFIG_PATH = ""     # empty → use $OCIO env var or PyOpenColorIO built-in default
 
 # ── Icons ───────────────────────────────────────────────────────────────────
 ICONS_DIR: _Path = _Path(__file__).parent.parent / "icons"
