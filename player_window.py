@@ -1800,6 +1800,7 @@ class BlastPlayerWindow(QMainWindow):
         self._build_menu()
         self._setup_shortcuts()
         self._restore_geometry()
+        self._restore_settings()
 
     # ------------------------------------------------------------------ #
     #  Title                                                               #
@@ -1853,28 +1854,45 @@ class BlastPlayerWindow(QMainWindow):
         pb.addAction("Go to End").setShortcut("End")
         pb.actions()[-1].triggered.connect(self._player._go_last)
         pb.addSeparator()
-        la = pb.addAction("Loop"); la.setCheckable(True)
-        la.triggered.connect(self._player._loop_btn.setChecked)
-        self._player._loop_btn.toggled.connect(la.setChecked)
+        self._loop_act = pb.addAction("Loop"); self._loop_act.setCheckable(True)
+        self._loop_act.triggered.connect(self._player._loop_btn.setChecked)
+        self._player._loop_btn.toggled.connect(self._loop_act.setChecked)
         pb.addSeparator()
         ss = pb.addMenu("Stepping and Scrubbing")
-        los = ss.addAction("Loop on Step"); los.setShortcut("Ctrl+Shift+."); los.setCheckable(True)
-        los.triggered.connect(lambda c: setattr(self._player, "_loop_on_step", c))
-        loc = ss.addAction("Loop on Scrub"); loc.setShortcut("Ctrl+Alt+."); loc.setCheckable(True)
-        loc.triggered.connect(lambda c: setattr(self._player, "_loop_on_scrub", c))
+        self._loop_on_step_act = ss.addAction("Loop on Step")
+        self._loop_on_step_act.setShortcut("Ctrl+Shift+.")
+        self._loop_on_step_act.setCheckable(True)
+        self._loop_on_step_act.triggered.connect(
+            lambda c: setattr(self._player, "_loop_on_step", c))
+        self._loop_on_scrub_act = ss.addAction("Loop on Scrub")
+        self._loop_on_scrub_act.setShortcut("Ctrl+Alt+.")
+        self._loop_on_scrub_act.setCheckable(True)
+        self._loop_on_scrub_act.triggered.connect(
+            lambda c: setattr(self._player, "_loop_on_scrub", c))
 
         # Audio
         am = mb.addMenu("Audio")
-        am.addAction("Volume Up").triggered.connect(
+        vol_up_act = am.addAction("Volume Up")
+        vol_up_act.setShortcut("Shift+Up")
+        vol_up_act.triggered.connect(
             lambda: self._player._vol_slider.setValue(
                 min(100, self._player._vol_slider.value() + 5)))
-        am.addAction("Volume Down").triggered.connect(
+        vol_dn_act = am.addAction("Volume Down")
+        vol_dn_act.setShortcut("Shift+Down")
+        vol_dn_act.triggered.connect(
             lambda: self._player._vol_slider.setValue(
                 max(0, self._player._vol_slider.value() - 5)))
         am.addSeparator()
-        scrub_act = am.addAction("Audio Scrubbing")
-        scrub_act.setCheckable(True)
-        scrub_act.triggered.connect(
+        self._mute_act = am.addAction("Mute")
+        self._mute_act.setCheckable(True)
+        self._mute_act.setShortcut("Ctrl+M")
+        self._mute_act.triggered.connect(self._player._toggle_mute)
+        self._player._vol_slider.valueChanged.connect(
+            lambda v: self._mute_act.setChecked(v == 0))
+        am.addSeparator()
+        self._scrub_act = am.addAction("Audio Scrubbing")
+        self._scrub_act.setCheckable(True)
+        self._scrub_act.triggered.connect(
             lambda checked: setattr(self._player, "_audio_scrub_enabled", checked))
 
         # Video
@@ -1949,6 +1967,49 @@ class BlastPlayerWindow(QMainWindow):
         s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
         s.setValue("windowGeometry", self.saveGeometry())
 
+    def _restore_settings(self):
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+
+        # Volume / mute — set slider which propagates to _volume and mute button icon
+        pre_mute = int(s.value("preMuteVolume", 100))
+        muted    = s.value("muted", False, type=bool)
+        volume   = int(s.value("volume", 100))
+        self._player._pre_mute_volume = pre_mute
+        self._player._vol_slider.setValue(0 if muted else volume)
+
+        # Audio scrubbing
+        scrub = s.value("audioScrubbing", False, type=bool)
+        self._player._audio_scrub_enabled = scrub
+        self._scrub_act.setChecked(scrub)
+
+        # Loop — setChecked triggers _on_loop_toggled which syncs _loop and the menu action
+        loop = s.value("loop", False, type=bool)
+        self._player._loop_btn.setChecked(loop)
+
+        # Loop on step / scrub
+        loop_step  = s.value("loopOnStep",  False, type=bool)
+        loop_scrub = s.value("loopOnScrub", False, type=bool)
+        self._player._loop_on_step  = loop_step
+        self._player._loop_on_scrub = loop_scrub
+        self._loop_on_step_act.setChecked(loop_step)
+        self._loop_on_scrub_act.setChecked(loop_scrub)
+
+        # Playback speed
+        speed_idx = int(s.value("speedIndex", 3))
+        speed_idx = max(0, min(speed_idx, len(PlayerWidget._SPEEDS) - 1))
+        self._player._speed_combo.setCurrentIndex(speed_idx)
+
+    def _save_settings(self):
+        s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        s.setValue("volume",         self._player._volume)
+        s.setValue("preMuteVolume",  self._player._pre_mute_volume)
+        s.setValue("muted",          self._player._volume == 0)
+        s.setValue("audioScrubbing", self._player._audio_scrub_enabled)
+        s.setValue("loop",           self._player._loop)
+        s.setValue("loopOnStep",     self._player._loop_on_step)
+        s.setValue("loopOnScrub",    self._player._loop_on_scrub)
+        s.setValue("speedIndex",     self._player._speed_combo.currentIndex())
+
     def _toggle_fullscreen(self):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
@@ -1996,5 +2057,6 @@ class BlastPlayerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._save_geometry()
+        self._save_settings()
         self._player.stop()
         super().closeEvent(event)
