@@ -604,6 +604,7 @@ class PlayerWidget(QWidget):
 
         # Audio
         self._volume          = 100
+        self._pre_mute_volume = 100   # volume restored when un-muting
         self._audio_proc      = None
         self._audio_scrub_enabled = False
         self._scrub_proc      = None
@@ -989,8 +990,8 @@ class PlayerWidget(QWidget):
             except Exception as exc:
                 print(f"[BlastPlayer] reverse cache: {exc}")
 
-            # Store reversed so pop() gives descending frame numbers
-            self._reverse_cache  = list(reversed(frames))
+            # Ascending order — pop() removes from the end, giving descending frame numbers
+            self._reverse_cache  = frames
             self._cache_building = False
             # Re-enter the Qt main thread to restart the timer
             QTimer.singleShot(0, self._resume_reverse)
@@ -1148,8 +1149,9 @@ class PlayerWidget(QWidget):
         self._speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         right_layout.addWidget(self._speed_combo)
 
-        vol_ic = _nav_btn("", "volume-up.png", tooltip="Volume", w=24, h=28)
-        right_layout.addWidget(vol_ic)
+        self._vol_btn = _nav_btn("", "volume-up.png", tooltip="Mute / Unmute", w=24, h=28)
+        self._vol_btn.clicked.connect(self._toggle_mute)
+        right_layout.addWidget(self._vol_btn)
 
         self._vol_slider = QSlider(Qt.Horizontal)
         self._vol_slider.setRange(0, 100)
@@ -1215,7 +1217,8 @@ class PlayerWidget(QWidget):
 
         self._play_frame_start = self._current_frame
         self._play_clock_start = time.monotonic()
-        self._start_audio()
+        if not reverse:
+            self._start_audio()
 
         interval = max(1, int(1000 / (self._fps * self._speed)))
         self._timer.start(interval)
@@ -1237,29 +1240,49 @@ class PlayerWidget(QWidget):
             return
 
         if self._play_reverse:
-            # ── Reverse: pop from pre-decoded cache ──────────────────── #
-            if not self._reverse_cache and not self._cache_building:
-                if self._current_frame <= 0:
+            # ── Reverse ───────────────────────────────────────────────── #
+            if self._frame_cache is not None:
+                # Fast path: serve directly from RAM cache — no batch decode
+                next_frame = self._current_frame - 1
+                if next_frame < 0:
                     if self._loop:
-                        self._seek_no_render(self._total_frames - 1)
-                        self._reverse_cache = []
-                        self._start_audio()
+                        last = len(self._frame_cache) - 1
+                        self._current_frame = last
+                        self._render_raw(self._frame_cache[last])
                         self._scrubber.blockSignals(True)
-                        self._scrubber.setValue(self._current_frame)
+                        self._scrubber.setValue(last)
                         self._scrubber.blockSignals(False)
                         self._update_info()
                     else:
                         self._pause()
                     return
-                self._build_reverse_cache(self._current_frame)
-                return   # timer restarted by _resume_reverse when cache ready
+                self._render_raw(self._frame_cache[next_frame])
+                self._current_frame = next_frame
 
-            if not self._reverse_cache:
-                return   # still building
+            else:
+                # Batch-decode path (used when RAM cache isn't available)
+                if not self._reverse_cache and not self._cache_building:
+                    if self._current_frame <= 0:
+                        if self._loop:
+                            self._seek_no_render(self._total_frames - 1)
+                            self._reverse_cache = []
+                            self._scrubber.blockSignals(True)
+                            self._scrubber.setValue(self._current_frame)
+                            self._scrubber.blockSignals(False)
+                            self._update_info()
+                        else:
+                            self._pause()
+                        return
+                    # Pass current_frame - 1 so the first pop is the frame before us
+                    self._build_reverse_cache(self._current_frame - 1)
+                    return   # timer restarted by _resume_reverse when cache ready
 
-            frame_num, raw      = self._reverse_cache.pop()
-            self._current_frame = frame_num
-            self._render_raw(raw)
+                if not self._reverse_cache:
+                    return   # still building
+
+                frame_num, raw      = self._reverse_cache.pop()
+                self._current_frame = frame_num
+                self._render_raw(raw)
 
         else:
             # ── Forward play (wall-clock sync) ────────────────────────── #
@@ -1567,9 +1590,18 @@ class PlayerWidget(QWidget):
         except Exception:
             pass
 
+    def _toggle_mute(self):
+        if self._volume > 0:
+            self._pre_mute_volume = self._volume
+            self._vol_slider.setValue(0)
+        else:
+            self._vol_slider.setValue(self._pre_mute_volume)
+
     def _on_volume_changed(self, value: int):
         self._volume = value
         self._vol_lbl.setText(f"{value}%")
+        icon = "mute.png" if value == 0 else "volume-up.png"
+        self._vol_btn.setIcon(_icon(icon))
         if self._is_playing:
             self._stop_audio()
             self._start_audio()
