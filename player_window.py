@@ -1882,7 +1882,9 @@ class BlastPlayerWindow(QMainWindow):
         hm = mb.addMenu("Help")
         hm.addAction("Keyboard Shortcuts")
         hm.addSeparator()
-        hm.addAction("About BlastPlayer").triggered.connect(self._on_about)
+        about_act = hm.addAction("About BlastPlayer")
+        about_act.setMenuRole(QAction.NoRole)   # prevent macOS from auto-moving to app menu
+        about_act.triggered.connect(self._on_about)
 
     # ------------------------------------------------------------------ #
     #  Open video                                                          #
