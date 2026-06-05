@@ -602,8 +602,14 @@ void main() {
     def __init__(self, parent=None):
         fmt = QSurfaceFormat()
         fmt.setSwapInterval(0)
-        fmt.setVersion(3, 0)
-        fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
+        # macOS only provides a CoreProfile context for OpenGL 3.2+.
+        # Windows/Linux support CompatibilityProfile at 3.0 which is broader.
+        if sys.platform == "darwin":
+            fmt.setVersion(3, 2)
+            fmt.setProfile(QSurfaceFormat.CoreProfile)
+        else:
+            fmt.setVersion(3, 0)
+            fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
         QSurfaceFormat.setDefaultFormat(fmt)
         super().__init__(parent)
 
