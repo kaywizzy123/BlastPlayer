@@ -88,6 +88,7 @@ def _nav_btn(text: str = "", icon_name: str = "",
     else:
         btn.setText(text)
     btn.setFixedSize(w, h)
+    btn.setFocusPolicy(Qt.NoFocus)
     if tooltip:
         btn.setToolTip(tooltip)
     btn.setStyleSheet(f"""
@@ -1052,6 +1053,7 @@ class PlayerWidget(QWidget):
 
         self._scrubber = ScrubberSlider(Qt.Horizontal)
         self._scrubber.setRange(0, 0)
+        self._scrubber.setFocusPolicy(Qt.NoFocus)
         self._scrubber.setStyleSheet(self._scrubber_style())
         self._scrubber.sliderPressed.connect(self._on_scrubber_pressed)
         self._scrubber.sliderReleased.connect(self._on_scrubber_released)
@@ -1090,6 +1092,7 @@ class PlayerWidget(QWidget):
         self._loop_btn.setIconSize(QSize(16, 16))
         self._loop_btn.setCheckable(True)
         self._loop_btn.setFixedSize(28, 28)
+        self._loop_btn.setFocusPolicy(Qt.NoFocus)
         self._loop_btn.setToolTip("Loop")
         self._loop_btn.setStyleSheet(self._loop_style(False))
         self._loop_btn.toggled.connect(self._on_loop_toggled)
@@ -1126,6 +1129,7 @@ class PlayerWidget(QWidget):
         self._speed_combo.setCurrentIndex(3)
         self._speed_combo.setFixedWidth(38)
         self._speed_combo.setFixedHeight(22)
+        self._speed_combo.setFocusPolicy(Qt.NoFocus)
         self._speed_combo.setToolTip("Playback speed")
         self._speed_combo.setStyleSheet(f"""
             QComboBox {{
@@ -1151,6 +1155,7 @@ class PlayerWidget(QWidget):
         self._vol_slider.setRange(0, 100)
         self._vol_slider.setValue(self._volume)
         self._vol_slider.setFixedWidth(80)
+        self._vol_slider.setFocusPolicy(Qt.NoFocus)
         self._vol_slider.setToolTip("Volume")
         self._vol_slider.setStyleSheet(self._scrubber_style())
         self._vol_slider.valueChanged.connect(self._on_volume_changed)
