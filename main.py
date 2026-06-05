@@ -21,7 +21,7 @@ REQUEST_FILE = Path(tempfile.gettempdir()) / "blastvault_player_request.txt"
 
 
 def _setup_file_watcher(window: "BlastPlayerWindow") -> QFileSystemWatcher:
-    """Watch REQUEST_FILE; when BlastVault writes a path there, load it."""
+    """Watch REQUEST_FILE; when BlastVault writes paths there, load them."""
     watcher = QFileSystemWatcher()
     # Watch the directory — the file may not exist yet on first launch.
     watcher.addPath(str(REQUEST_FILE.parent))
@@ -30,14 +30,19 @@ def _setup_file_watcher(window: "BlastPlayerWindow") -> QFileSystemWatcher:
         if not REQUEST_FILE.exists():
             return
         try:
-            video_path = REQUEST_FILE.read_text(encoding="utf-8").strip()
+            content = REQUEST_FILE.read_text(encoding="utf-8").strip()
             REQUEST_FILE.unlink(missing_ok=True)
         except OSError:
             return
-        if video_path and Path(video_path).is_file():
-            window.open_video(video_path)
-            window.raise_()
-            window.activateWindow()
+        paths = [p for p in content.splitlines() if p.strip() and Path(p.strip()).is_file()]
+        if not paths:
+            return
+        if len(paths) == 1:
+            window.open_video(paths[0])
+        else:
+            window.open_playlist(paths)
+        window.raise_()
+        window.activateWindow()
 
     watcher.directoryChanged.connect(_on_dir_changed)
     return watcher
@@ -55,14 +60,16 @@ def main():
     window = BlastPlayerWindow()
     window.show()
 
-    # Watch for BlastVault "load this video" requests — keep ref on window.
+    # Watch for BlastVault "load this video/playlist" requests — keep ref on window.
     window._file_watcher = _setup_file_watcher(window)
 
-    # Open a video passed via command line
+    # Open video(s) passed via command line
     if len(sys.argv) > 1:
-        video_path = sys.argv[1]
-        if Path(video_path).is_file():
-            window.open_video(video_path)
+        video_paths = [p for p in sys.argv[1:] if Path(p).is_file()]
+        if len(video_paths) == 1:
+            window.open_video(video_paths[0])
+        elif len(video_paths) > 1:
+            window.open_playlist(video_paths)
 
     sys.exit(app.exec_())
 

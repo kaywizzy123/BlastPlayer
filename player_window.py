@@ -25,12 +25,14 @@ No OpenCV dependency.
 """
 
 import sys
+import os
 import json
 import time
 import array
 import queue
 import threading
 import subprocess
+import tempfile
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -39,7 +41,8 @@ from PyQt5.QtWidgets import (
     QPushButton, QSlider, QSizePolicy,
     QAction, QFileDialog, QMessageBox,
     QFrame, QToolButton, QActionGroup, QComboBox, QShortcut,
-    QOpenGLWidget,
+    QOpenGLWidget, QListWidget, QListWidgetItem, QMenu, QSplitter,
+    QApplication,
 )
 from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QSettings
 from PyQt5.QtGui import (
@@ -183,6 +186,211 @@ def probe_video(path: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Playlist sidebar
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PlaylistSidebar(QWidget):
+    video_selected           = pyqtSignal(str)    # emitted on double-click (single video)
+    selection_play_requested = pyqtSignal(list)   # emitted when playing a multi-selection
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setMinimumWidth(140)
+        self.setAcceptDrops(True)
+        self._paths            = []
+        self._active_selection = []   # non-empty → advance only within this subset
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Header bar
+        hdr = QWidget()
+        hdr.setFixedHeight(34)
+        hdr.setStyleSheet(f"background: {constants.BORDER};")
+        hdr_l = QHBoxLayout(hdr)
+        hdr_l.setContentsMargins(10, 0, 6, 0)
+        title = QLabel("Playlist")
+        title.setStyleSheet(
+            f"color: {constants.TEXT_PRI}; font-size: 12px;"
+            f" font-weight: bold; background: transparent;")
+        hdr_l.addWidget(title)
+        hdr_l.addStretch()
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedHeight(20)
+        clear_btn.setFocusPolicy(Qt.NoFocus)
+        clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {constants.ACCENT}; color: {constants.TEXT_SEC};
+                border: none; border-radius: 3px; font-size: 10px; padding: 0 8px;
+            }}
+            QPushButton:hover {{ background: {constants.ACCENT_HI}; color: white; }}
+        """)
+        clear_btn.clicked.connect(self.clear)
+        hdr_l.addWidget(clear_btn)
+        root.addWidget(hdr)
+
+        # Video list
+        self._list = QListWidget()
+        self._list.setStyleSheet(f"""
+            QListWidget {{
+                background: #1c1c1c;
+                color: {constants.TEXT_PRI};
+                border: none;
+                font-size: 11px;
+                outline: none;
+            }}
+            QListWidget::item {{
+                padding: 7px 10px;
+                border-bottom: 1px solid {constants.BORDER};
+            }}
+            QListWidget::item:selected {{
+                background: {constants.ACCENT_HI};
+                color: white;
+            }}
+            QListWidget::item:hover:!selected {{
+                background: {constants.ACCENT};
+            }}
+        """)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._list.verticalScrollBar().setStyleSheet(f"""
+            QScrollBar:vertical {{
+                background: #1c1c1c; width: 6px; border: none; margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {constants.ACCENT}; border-radius: 3px; min-height: 20px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: {constants.ACCENT_HI}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+        """)
+        # Multi-select + drag-to-reorder
+        self._list.setSelectionMode(QListWidget.ExtendedSelection)
+        self._list.setDragDropMode(QListWidget.InternalMove)
+        self._list.setDefaultDropAction(Qt.MoveAction)
+        self._list.model().rowsMoved.connect(self._sync_paths)
+        # Context menu
+        self._list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._show_context_menu)
+        # Double-click to play (clears any active sub-selection)
+        self._list.itemClicked.connect(self._on_item_clicked)
+        root.addWidget(self._list, stretch=1)
+
+    # ── Public API ────────────────────────────────────────────────────── #
+
+    def add_video(self, path: str):
+        if path in self._paths:
+            return
+        self._paths.append(path)
+        item = QListWidgetItem(Path(path).name)
+        item.setData(Qt.UserRole, path)
+        item.setToolTip(path)
+        self._list.addItem(item)
+
+    def set_current(self, path: str):
+        for i in range(self._list.count()):
+            if self._list.item(i).data(Qt.UserRole) == path:
+                self._list.setCurrentRow(i)
+                return
+        self._list.clearSelection()
+
+    def next_path(self, current_path: str):
+        source = self._active_selection if self._active_selection else self._paths
+        try:
+            idx = source.index(current_path)
+            if idx + 1 < len(source):
+                return source[idx + 1]
+        except ValueError:
+            pass
+        return None
+
+    def clear(self):
+        self._list.clear()
+        self._paths.clear()
+        self._active_selection.clear()
+
+    # ── Drag-and-drop ─────────────────────────────────────────────────── #
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if Path(path).suffix.lower() in constants.VIDEO_EXTS:
+                self.add_video(path)
+
+    # ── Private ───────────────────────────────────────────────────────── #
+
+    def _on_item_clicked(self, item):
+        if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
+            return  # modifier held — just update selection, don't play
+        self._active_selection.clear()
+        self.video_selected.emit(item.data(Qt.UserRole))
+
+    def _play_selected(self):
+        selected = self._list.selectedItems()
+        if not selected:
+            return
+        selected.sort(key=lambda item: self._list.row(item))
+        paths = [item.data(Qt.UserRole) for item in selected]
+        self._active_selection = paths
+        self.selection_play_requested.emit(paths)
+
+    def _show_context_menu(self, pos):
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {constants.BORDER};
+                color: {constants.TEXT_PRI};
+                border: 1px solid {constants.SPLITTER_COLOR};
+                font-size: 11px;
+            }}
+            QMenu::item {{ padding: 6px 18px; }}
+            QMenu::item:selected {{ background: {constants.ACCENT_HI}; color: white; }}
+            QMenu::separator {{ height: 1px; background: {constants.SPLITTER_COLOR}; margin: 2px 0; }}
+        """)
+        add_act = menu.addAction("Add Videos…")
+        add_act.triggered.connect(self._on_add_clicked)
+        selected = self._list.selectedItems()
+        if len(selected) >= 2:
+            play_sel_act = menu.addAction(f"Play Selected  ({len(selected)})")
+            play_sel_act.triggered.connect(self._play_selected)
+        item = self._list.itemAt(pos)
+        if item is not None:
+            menu.addSeparator()
+            remove_act = menu.addAction("Remove from Playlist")
+            remove_act.triggered.connect(lambda: self._remove_item(item))
+        menu.exec_(self._list.mapToGlobal(pos))
+
+    def _remove_item(self, item):
+        path = item.data(Qt.UserRole)
+        self._list.takeItem(self._list.row(item))
+        if path in self._paths:
+            self._paths.remove(path)
+
+    def _sync_paths(self):
+        self._paths = [
+            self._list.item(i).data(Qt.UserRole)
+            for i in range(self._list.count())
+        ]
+
+    def _on_add_clicked(self):
+        exts = " ".join(f"*{e}" for e in sorted(constants.VIDEO_EXTS))
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add videos to playlist", "",
+            f"Video files ({exts});;All files (*)")
+        for p in paths:
+            self.add_video(p)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Welcome screen
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -307,7 +515,7 @@ class ScrubberSlider(QSlider):
         if self._in_frame is None and self._out_frame is None:
             return
 
-        opt = QStyleOptionSlider()
+        opt    = QStyleOptionSlider()
         self.initStyleOption(opt)
         groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
         handle = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
@@ -603,6 +811,8 @@ class PlayerWidget(QWidget):
     _SPEED_LABELS = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
     _CACHE_MAX_MB = 2048   # skip RAM cache if decoded frames exceed this
 
+    video_ended = pyqtSignal()   # emitted when video reaches end without looping
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -648,6 +858,19 @@ class PlayerWidget(QWidget):
         # Reverse frame cache
         self._reverse_cache   = []      # list of (frame_num, raw_bytes), pop() = backward
         self._cache_building  = False   # True while background thread is filling cache
+
+        # Autoplay
+        self._autoplay = True
+
+        # Multi-clip timeline
+        self._mc_clips           = []   # list of {path, fps, total_frames, width, height, offset}
+        self._mc_idx             = -1   # -1 = single-clip mode
+        self._mc_audio_proc      = None   # single ffplay covering all clips via concat
+        self._mc_audio_list_path = None   # temp file path for the ffconcat list
+        self._mc_next_proc   = None           # pre-warmed pipe for the next clip
+        self._mc_next_queue  = None
+        self._mc_next_thread = None
+        self._mc_next_stop   = threading.Event()
 
         # In / out points
         self._in_frame  = None   # int | None
@@ -715,6 +938,8 @@ class PlayerWidget(QWidget):
         self._show_frame(0)
         self._update_info()
         self._start_cache_build()
+        if self._autoplay:
+            self._play()
         return True
 
     def stop(self):
@@ -760,6 +985,182 @@ class PlayerWidget(QWidget):
         self._in_frame  = None
         self._out_frame = None
         self._scrubber.set_in_out(None, None)
+
+    # ------------------------------------------------------------------ #
+    #  Multi-clip timeline                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _mc_offset(self) -> int:
+        """Global frame offset of the currently active clip."""
+        if self._mc_idx >= 0 and self._mc_clips:
+            return self._mc_clips[self._mc_idx]['offset']
+        return 0
+
+    def _global_to_local(self, global_frame: int):
+        """Return (local_frame, clip_index) for a global scrubber position."""
+        for i, clip in enumerate(self._mc_clips):
+            if global_frame < clip['offset'] + clip['total_frames']:
+                return global_frame - clip['offset'], i
+        last = self._mc_clips[-1]
+        return last['total_frames'] - 1, len(self._mc_clips) - 1
+
+    def load_multi_clips(self, paths: list):
+        """Probe all paths, set scrubber to combined length, and start playing."""
+        clips  = []
+        offset = 0
+        for path in paths:
+            try:
+                info = probe_video(path)
+            except RuntimeError:
+                continue
+            clips.append({
+                'path':         path,
+                'fps':          info['fps'],
+                'total_frames': info['total_frames'],
+                'width':        info['width'],
+                'height':       info['height'],
+                'offset':       offset,
+            })
+            offset += info['total_frames']
+        if not clips:
+            return
+
+        # load_video clears _mc_clips/_mc_idx via _cleanup — set them back after
+        if not self.load_video(clips[0]['path']):
+            return
+        self._mc_clips = clips
+        self._mc_idx   = 0
+        total = offset
+        self._scrubber.blockSignals(True)
+        self._scrubber.setRange(0, max(total - 1, 0))
+        self._scrubber.setValue(0)
+        self._scrubber.blockSignals(False)
+        self._frames_lbl.setText(f"{total} frames")
+        # Switch from single-clip audio to the continuous concat stream
+        self._stop_audio()
+        self._start_mc_audio()
+        # Pre-warm clip 1's video pipe while clip 0 plays
+        if len(clips) > 1:
+            self._open_mc_next_pipe(clips[1])
+
+    def _open_mc_next_pipe(self, clip: dict):
+        """Start decoding the next clip's frames in the background so adoption is instant."""
+        self._close_mc_next_pipe()
+        w, h   = clip['width'], clip['height']
+        nbytes = w * h * 3
+        cmd = [
+            _ffmpeg_exe(),
+            "-i",       clip['path'],
+            "-f",       "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-vf",      "null",
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._mc_next_proc  = proc
+            self._mc_next_stop.clear()
+            self._mc_next_queue = queue.Queue(maxsize=4)
+            q    = self._mc_next_queue
+            stop = self._mc_next_stop
+            def _read():
+                while not stop.is_set():
+                    try:
+                        raw = proc.stdout.read(nbytes)
+                    except Exception:
+                        break
+                    if len(raw) < nbytes:
+                        try: q.put(None, timeout=1.0)
+                        except queue.Full: pass
+                        break
+                    q.put(bytes(raw))
+            self._mc_next_thread = threading.Thread(target=_read, daemon=True)
+            self._mc_next_thread.start()
+        except Exception as exc:
+            print(f"[BlastPlayer] mc_next_pipe: {exc}")
+            self._mc_next_proc = None
+
+    def _close_mc_next_pipe(self):
+        self._mc_next_stop.set()
+        self._mc_next_thread = None
+        if self._mc_next_proc is not None:
+            try:
+                self._mc_next_proc.stdout.close()
+                self._mc_next_proc.terminate()
+            except Exception:
+                pass
+            self._mc_next_proc = None
+        if self._mc_next_queue is not None:
+            while True:
+                try: self._mc_next_queue.get_nowait()
+                except queue.Empty: break
+            self._mc_next_queue = None
+        self._mc_next_stop.clear()
+
+    def _advance_to_clip(self, clip: dict):
+        """
+        Transition to the next clip.
+        If a pre-warmed pipe exists for this clip, adopts it instantly (zero ffmpeg
+        startup gap).  Otherwise falls back to opening a fresh pipe.
+        """
+        self._timer.stop()
+        self._close_pipe()          # stops old reader thread, drains old queue
+        self._close_loop_pipe()
+        self._close_lookahead()
+        # Audio is NOT stopped here — the concat stream plays continuously across clips
+
+        self._path             = clip['path']
+        self._fps              = clip['fps']
+        self._total_frames     = clip['total_frames']
+        self._vid_w            = clip['width']
+        self._vid_h            = clip['height']
+        self._current_frame    = 0
+        self._pipe_frame       = 0
+        self._is_playing       = True
+        self._play_reverse     = False
+        self._reverse_cache    = []
+        self._cache_building   = False
+        self._loop_frame0      = None
+        self._frame_cache      = None
+        self._cache_loading    = False
+        self._play_frame_start = 0
+        self._play_clock_start = time.monotonic()
+        self._play_btn.setIcon(_icon("pause.png"))
+        self._play_btn.setText("")
+
+        self._scrubber.blockSignals(True)
+        self._scrubber.setRange(0, max(self._total_frames - 1, 0))
+        self._scrubber.setValue(0)
+        self._scrubber.blockSignals(False)
+
+        if self._mc_next_proc is not None:
+            # Adopt the pre-warmed pipe — frames already buffered, no startup wait
+            self._pipe_proc     = self._mc_next_proc
+            self._frame_queue   = self._mc_next_queue
+            self._reader_thread = self._mc_next_thread
+            self._reader_stop   = self._mc_next_stop
+            self._mc_next_proc   = None
+            self._mc_next_queue  = None
+            self._mc_next_thread = None
+            self._mc_next_stop   = threading.Event()
+            # Paint frame 0 immediately — closes the visual gap at the cut point.
+            # Set play_frame_start=1 so the next tick targets frame 1, not frame 0.
+            # Without this, floor(elapsed * fps) ≈ 0.98 truncates to 0, pipe_frame=1
+            # wins the comparison and nothing renders for a full extra interval.
+            try:
+                first_raw = self._frame_queue.get_nowait()
+                if first_raw is not None:
+                    self._render_raw(first_raw)
+                    self._pipe_frame       = 1
+                    self._play_frame_start = 1   # frame 0 already consumed
+                    self._play_clock_start = time.monotonic()
+            except queue.Empty:
+                pass  # pre-warm not ready; normal tick loop catches frame 0
+        else:
+            self._open_pipe(0)
+
+        self._start_cache_build()
+        self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
 
     # ------------------------------------------------------------------ #
     #  FFmpeg frame helpers                                                #
@@ -1108,15 +1509,34 @@ class PlayerWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Video canvas
+        # ── Content row: playlist sidebar + video canvas ──────────────────
+        self._content_splitter = QSplitter(Qt.Horizontal)
+        self._content_splitter.setHandleWidth(2)
+        self._content_splitter.setStyleSheet("""
+            QSplitter::handle:horizontal { background: #2a2a2a; }
+            QSplitter::handle:horizontal:hover { background: #444; }
+        """)
+
+        self._playlist_sidebar = PlaylistSidebar()
+        self._playlist_sidebar.setVisible(False)
+        self._playlist_sidebar.video_selected.connect(self._on_playlist_select)
+        self._playlist_sidebar.selection_play_requested.connect(self.load_multi_clips)
+        self._content_splitter.addWidget(self._playlist_sidebar)
+
         self._canvas = VideoCanvas()
         self._canvas.zoom_scrolled.connect(self._on_zoom_scroll)
         self._canvas.pan_dragged.connect(self._on_pan_drag)
-        root.addWidget(self._canvas, stretch=1)
+        self._content_splitter.addWidget(self._canvas)
+
+        self._content_splitter.setSizes([240, 10000])
+        self._content_splitter.setCollapsible(0, False)
+        self._content_splitter.setCollapsible(1, False)
+
+        root.addWidget(self._content_splitter, stretch=1)
 
         # ── Timeline strip ────────────────────────────────────────────────
         timeline = QWidget()
-        timeline.setFixedHeight(42)
+        timeline.setFixedHeight(64)
         timeline.setStyleSheet("background: black;")
         tl = QVBoxLayout(timeline)
         tl.setContentsMargins(0, 2, 0, 2)
@@ -1173,6 +1593,23 @@ class PlayerWidget(QWidget):
         tr = QHBoxLayout(transport)
         tr.setContentsMargins(8, 0, 8, 0)
         tr.setSpacing(2)
+
+        # Playlist toggle — far left
+        self._playlist_btn = QPushButton()
+        ic = _icon("list.png")
+        if not ic.isNull():
+            self._playlist_btn.setIcon(ic)
+            self._playlist_btn.setIconSize(QSize(14, 14))
+        else:
+            self._playlist_btn.setText("≡")
+        self._playlist_btn.setCheckable(True)
+        self._playlist_btn.setFixedSize(28, 28)
+        self._playlist_btn.setFocusPolicy(Qt.NoFocus)
+        self._playlist_btn.setToolTip("Show / Hide Playlist")
+        self._playlist_btn.setStyleSheet(self._loop_style(False))
+        self._playlist_btn.toggled.connect(self._toggle_playlist)
+        tr.addWidget(self._playlist_btn)
+        tr.addSpacing(6)
 
         tr.addStretch(1)
 
@@ -1313,7 +1750,10 @@ class PlayerWidget(QWidget):
         self._play_frame_start = self._current_frame
         self._play_clock_start = time.monotonic()
         if not reverse:
-            self._start_audio()
+            if self._mc_idx >= 0 and self._mc_clips:
+                self._start_mc_audio()
+            else:
+                self._start_audio()
 
         interval = max(1, int(1000 / (self._fps * self._speed)))
         self._timer.start(interval)
@@ -1326,8 +1766,8 @@ class PlayerWidget(QWidget):
         self._close_loop_pipe()
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
+        self._stop_mc_audio()
         self._stop_audio()
-        # Re-render current frame at full SmoothTransformation quality now that we're paused
         self._refresh_display()
 
     def _on_tick(self):
@@ -1396,7 +1836,8 @@ class PlayerWidget(QWidget):
                 out  = min(self._effective_out(), len(self._frame_cache) - 1)
                 in_f = self._effective_in()
                 if target_frame > out:
-                    if self._loop:
+                    if self._loop and self._mc_idx < 0:
+                        # Single-clip loop
                         self._stop_audio()
                         self._play_frame_start = in_f
                         self._play_clock_start = time.monotonic()
@@ -1409,7 +1850,7 @@ class PlayerWidget(QWidget):
                         self._scrubber.blockSignals(False)
                         self._update_info()
                     else:
-                        self._pause()
+                        self._end_of_video()
                     return
 
                 if target_frame <= self._current_frame:
@@ -1444,7 +1885,7 @@ class PlayerWidget(QWidget):
                         self._render_raw(raw)
                         self._current_frame = self._pipe_frame - 1
                     in_f = self._effective_in()
-                    if self._loop:
+                    if self._loop and self._mc_idx < 0:
                         self._stop_audio()
                         if out_reached or in_f > 0:
                             # Range loop or non-zero in point: simple re-seek
@@ -1500,7 +1941,7 @@ class PlayerWidget(QWidget):
                             self._scrubber.blockSignals(False)
                             self._update_info()
                     else:
-                        self._pause()
+                        self._end_of_video()
                     return
 
                 if raw is not None:
@@ -1517,7 +1958,7 @@ class PlayerWidget(QWidget):
 
         if not self._scrubber_moving:
             self._scrubber.blockSignals(True)
-            self._scrubber.setValue(self._current_frame)
+            self._scrubber.setValue(self._mc_offset() + self._current_frame)
             self._scrubber.blockSignals(False)
         self._update_info()
 
@@ -1606,11 +2047,51 @@ class PlayerWidget(QWidget):
         if self._is_playing:
             self._timer.stop()
             self._close_pipe()
+            self._stop_mc_audio()
             self._stop_audio()
 
     def _on_scrubber_released(self):
         self._scrubber_moving = False
-        self._current_frame   = self._scrubber.value()
+        global_val = self._scrubber.value()
+
+        if self._mc_idx >= 0 and self._mc_clips:
+            local_frame, target_idx = self._global_to_local(global_val)
+            was_playing = self._is_playing
+            if target_idx != self._mc_idx:
+                # Seeking into a different clip — load it, restore multi-clip state
+                clips_backup = self._mc_clips
+                next_clip    = clips_backup[target_idx]
+                self.load_video(next_clip['path'])
+                self._mc_clips = clips_backup
+                self._mc_idx   = target_idx
+                total = sum(c['total_frames'] for c in clips_backup)
+                self._scrubber.blockSignals(True)
+                self._scrubber.setRange(0, max(total - 1, 0))
+                self._scrubber.blockSignals(False)
+                self._frames_lbl.setText(f"{total} frames")
+                if not was_playing:
+                    self._pause()
+            # Seek to the local frame within the (now-active) clip
+            self._current_frame = local_frame
+            if self._is_playing:
+                self._stop_mc_audio()
+                if self._play_reverse:
+                    self._reverse_cache = []
+                elif self._frame_cache is not None:
+                    self._pipe_frame = local_frame
+                else:
+                    self._open_pipe(local_frame)
+                self._play_frame_start = local_frame
+                self._play_clock_start = time.monotonic()
+                self._start_mc_audio()
+                self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
+            else:
+                self._show_frame(local_frame)
+                self._update_info()
+            return
+
+        # Single-clip mode — original behaviour
+        self._current_frame = global_val
         if self._is_playing:
             self._stop_audio()
             if self._play_reverse:
@@ -1630,6 +2111,22 @@ class PlayerWidget(QWidget):
     def _on_scrubber_moved(self, value: int):
         if not self._path:
             return
+        if self._mc_idx >= 0 and self._mc_clips:
+            # Resolve global position to local frame in the active clip only
+            local_frame, clip_idx = self._global_to_local(value)
+            if clip_idx == self._mc_idx:
+                if self._frame_cache and local_frame < len(self._frame_cache):
+                    self._render_raw(self._frame_cache[local_frame])
+                else:
+                    raw = self._fetch_frame(local_frame)
+                    if raw:
+                        self._render_raw(raw)
+                self._current_frame = local_frame
+            self._update_info()
+            if self._audio_scrub_enabled:
+                self._scrub_debounce.start(80)
+            return
+        # Single-clip mode
         if self._frame_cache and value < len(self._frame_cache):
             self._render_raw(self._frame_cache[value])
         else:
@@ -1658,6 +2155,57 @@ class PlayerWidget(QWidget):
             self._close_loop_pipe()
 
     # ------------------------------------------------------------------ #
+    #  Playlist                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _toggle_playlist(self, checked: bool):
+        self._playlist_sidebar.setVisible(checked)
+        self._playlist_btn.setStyleSheet(self._loop_style(checked))
+
+    def _on_playlist_select(self, path: str):
+        from pathlib import Path as _P
+        if _P(path).is_file():
+            self.load_video(path)
+            self._playlist_sidebar.set_current(path)
+            QTimer.singleShot(0, self._refresh_display)
+
+    def _end_of_video(self):
+        """Called when the video reaches its natural end (no loop on single clip)."""
+        if self._mc_idx >= 0 and self._mc_clips:
+            next_idx = self._mc_idx + 1
+            # Wrap around when loop is on, stop when it isn't
+            if next_idx >= len(self._mc_clips):
+                if self._loop:
+                    next_idx = 0
+                else:
+                    self._stop_mc_audio()   # stop before resetting mc state
+                    self._mc_clips = []
+                    self._mc_idx   = -1
+                    self._pause()
+                    self.video_ended.emit()
+                    return
+            clips_backup = self._mc_clips
+            next_clip    = clips_backup[next_idx]
+            self._advance_to_clip(next_clip)
+            self._mc_clips = clips_backup
+            self._mc_idx   = next_idx
+            total = sum(c['total_frames'] for c in clips_backup)
+            self._scrubber.blockSignals(True)
+            self._scrubber.setRange(0, max(total - 1, 0))
+            self._scrubber.setValue(next_clip['offset'])
+            self._scrubber.blockSignals(False)
+            self._frames_lbl.setText(f"{total} frames")
+            # Pre-warm the clip after this one
+            prewarm_idx = next_idx + 1
+            if prewarm_idx < len(clips_backup):
+                self._open_mc_next_pipe(clips_backup[prewarm_idx])
+            elif self._loop and len(clips_backup) > 1:
+                self._open_mc_next_pipe(clips_backup[0])
+            return
+        self._pause()
+        self.video_ended.emit()
+
+    # ------------------------------------------------------------------ #
     #  Audio                                                               #
     # ------------------------------------------------------------------ #
 
@@ -1684,6 +2232,52 @@ class PlayerWidget(QWidget):
         if self._audio_proc and self._audio_proc.poll() is None:
             self._audio_proc.terminate()
         self._audio_proc = None
+
+    def _start_mc_audio(self):
+        """Start one ffplay process covering the full multi-clip sequence via concat."""
+        self._stop_mc_audio()
+        if not self._mc_clips or self._mc_idx < 0:
+            return
+        ffplay = _ffplay_exe()
+        if not Path(ffplay).exists():
+            return
+        # Seek = sum of all completed clips + position inside current clip
+        seek = sum(c['total_frames'] / c['fps'] for c in self._mc_clips[:self._mc_idx])
+        seek += self._current_frame / self._fps
+        # Write ffconcat list (forward-slash paths for cross-platform safety)
+        try:
+            f = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.txt', delete=False, encoding='utf-8')
+            f.write("ffconcat version 1.0\n")
+            for clip in self._mc_clips:
+                safe = clip['path'].replace('\\', '/')
+                f.write(f"file '{safe}'\n")
+            f.close()
+            self._mc_audio_list_path = f.name
+        except Exception as exc:
+            print(f"[BlastPlayer] mc_audio list: {exc}")
+            return
+        cmd = [ffplay, "-nodisp", "-autoexit", "-vn",
+               "-f", "concat", "-safe", "0",
+               "-i", self._mc_audio_list_path,
+               "-ss", f"{seek:.4f}",
+               "-volume", str(self._volume)]
+        try:
+            self._mc_audio_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            print(f"[BlastPlayer] mc_audio: {exc}")
+
+    def _stop_mc_audio(self):
+        if self._mc_audio_proc and self._mc_audio_proc.poll() is None:
+            self._mc_audio_proc.terminate()
+        self._mc_audio_proc = None
+        if self._mc_audio_list_path:
+            try:
+                os.unlink(self._mc_audio_list_path)
+            except Exception:
+                pass
+            self._mc_audio_list_path = None
 
     def _play_scrub_audio(self):
         """Short audio snippet at current frame for scrub feedback."""
@@ -1721,20 +2315,30 @@ class PlayerWidget(QWidget):
         icon = "mute.png" if value == 0 else "volume-up.png"
         self._vol_btn.setIcon(_icon(icon))
         if self._is_playing:
-            self._stop_audio()
-            self._start_audio()
+            if self._mc_idx >= 0 and self._mc_clips:
+                self._stop_mc_audio()
+                self._start_mc_audio()
+            else:
+                self._stop_audio()
+                self._start_audio()
 
     # ------------------------------------------------------------------ #
     #  Info update / frame callback                                        #
     # ------------------------------------------------------------------ #
 
     def _update_info(self):
-        f = self._current_frame
-        self._frame_num_lbl.setText(str(f + 1))
-        self._frames_lbl.setText(f"{self._total_frames} frames")
+        f          = self._current_frame
+        mc_off     = self._mc_offset()
+        global_f   = mc_off + f
+        self._frame_num_lbl.setText(str(global_f + 1))
+        if self._mc_idx >= 0 and self._mc_clips:
+            total = sum(c['total_frames'] for c in self._mc_clips)
+            self._frames_lbl.setText(f"{total} frames")
+        else:
+            self._frames_lbl.setText(f"{self._total_frames} frames")
         self._fps_lbl.setText(f"{self._fps:.2f} fps")
         if hasattr(self, '_on_frame_changed'):
-            self._on_frame_changed(f + 1)
+            self._on_frame_changed(global_f + 1)
 
     def set_frame_callback(self, fn):
         self._on_frame_changed = fn
@@ -1852,6 +2456,10 @@ class PlayerWidget(QWidget):
         self._cache_loading    = False
         self._play_clock_start = 0.0
         self._play_frame_start = 0
+        self._stop_mc_audio()
+        self._close_mc_next_pipe()
+        self._mc_clips = []
+        self._mc_idx   = -1
         self._in_frame  = None
         self._out_frame = None
         self._scrubber.set_in_out(None, None)
@@ -1945,6 +2553,7 @@ class BlastPlayerWindow(QMainWindow):
         self._setup_shortcuts()
         self._restore_geometry()
         self._restore_settings()
+        self._player.video_ended.connect(self._on_video_ended)
 
     # ------------------------------------------------------------------ #
     #  Title                                                               #
@@ -1997,6 +2606,13 @@ class BlastPlayerWindow(QMainWindow):
         pb.actions()[-1].triggered.connect(self._player._go_first)
         pb.addAction("Go to End").setShortcut("End")
         pb.actions()[-1].triggered.connect(self._player._go_last)
+        pb.addSeparator()
+        self._autoplay_act = pb.addAction("Autoplay")
+        self._autoplay_act.setCheckable(True)
+        self._autoplay_act.setChecked(True)
+        self._autoplay_act.setShortcut("Ctrl+A")
+        self._autoplay_act.triggered.connect(
+            lambda c: setattr(self._player, "_autoplay", c))
         pb.addSeparator()
         self._loop_act = pb.addAction("Loop"); self._loop_act.setCheckable(True)
         self._loop_act.triggered.connect(self._player._loop_btn.setChecked)
@@ -2104,9 +2720,26 @@ class BlastPlayerWindow(QMainWindow):
         self._stack.setCurrentIndex(1)
         self._player.setFocus()
         self._update_title(0)
-        # PlayerWidget was hidden during load_video so _display had no size yet;
-        # defer one tick so the layout has settled before we scale the pixmap.
+        self._player._playlist_sidebar.add_video(path)
+        self._player._playlist_sidebar.set_current(path)
         QTimer.singleShot(0, self._player._refresh_display)
+
+    def open_playlist(self, paths: list):
+        """Load *paths* as a playlist: open the first video and queue the rest."""
+        valid = [p for p in paths if Path(p).is_file()]
+        if not valid:
+            return
+        self.open_video(valid[0])
+        for path in valid[1:]:
+            self._player._playlist_sidebar.add_video(path)
+        # Show the playlist sidebar so the user can see the queue
+        self._player._playlist_sidebar.setVisible(True)
+        self._player._playlist_btn.setChecked(True)
+
+    def _on_video_ended(self):
+        next_path = self._player._playlist_sidebar.next_path(self._player._path)
+        if next_path:
+            self.open_video(next_path)
 
     def _setup_shortcuts(self):
         pass  # handled via keyPressEvent
@@ -2125,6 +2758,11 @@ class BlastPlayerWindow(QMainWindow):
 
     def _restore_settings(self):
         s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+
+        # Autoplay
+        autoplay = s.value("autoplay", True, type=bool)
+        self._player._autoplay = autoplay
+        self._autoplay_act.setChecked(autoplay)
 
         # Volume / mute — set slider which propagates to _volume and mute button icon
         pre_mute = int(s.value("preMuteVolume", 100))
@@ -2157,6 +2795,7 @@ class BlastPlayerWindow(QMainWindow):
 
     def _save_settings(self):
         s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+        s.setValue("autoplay",       self._player._autoplay)
         s.setValue("volume",         self._player._volume)
         s.setValue("preMuteVolume",  self._player._pre_mute_volume)
         s.setValue("muted",          self._player._volume == 0)
@@ -2205,11 +2844,15 @@ class BlastPlayerWindow(QMainWindow):
         event.ignore()
 
     def dropEvent(self, event: QDropEvent):
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if Path(path).suffix.lower() in constants.VIDEO_EXTS:
-                self.open_video(path)
-                break
+        paths = [
+            url.toLocalFile() for url in event.mimeData().urls()
+            if Path(url.toLocalFile()).suffix.lower() in constants.VIDEO_EXTS
+        ]
+        if not paths:
+            return
+        self.open_video(paths[0])          # play the first one immediately
+        for path in paths[1:]:             # queue the rest
+            self._player._playlist_sidebar.add_video(path)
 
     def closeEvent(self, event):
         self._save_geometry()
