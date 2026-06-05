@@ -1150,7 +1150,7 @@ class PlayerWidget(QWidget):
         self._scrubber = ScrubberSlider(Qt.Horizontal)
         self._scrubber.setRange(0, 0)
         self._scrubber.setFocusPolicy(Qt.NoFocus)
-        self._scrubber.setStyleSheet(self._scrubber_style())
+        self._scrubber.setStyleSheet(self._playback_scrubber_style())
         self._scrubber.sliderPressed.connect(self._on_scrubber_pressed)
         self._scrubber.sliderReleased.connect(self._on_scrubber_released)
         self._scrubber.sliderMoved.connect(self._on_scrubber_moved)
@@ -1862,6 +1862,26 @@ class PlayerWidget(QWidget):
     # ------------------------------------------------------------------ #
     #  Style helpers                                                       #
     # ------------------------------------------------------------------ #
+
+    def _playback_scrubber_style(self) -> str:
+        return f"""
+            QSlider::groove:horizontal {{
+                background: {constants.SPLITTER_COLOR};
+                height: 4px; border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {constants.ACCENT_HI};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: white;
+                width: 3px; height: 18px;
+                border-radius: 1px; margin: -7px 0;
+            }}
+            QSlider::handle:horizontal:hover {{
+                background: {constants.ACCENT_HI};
+            }}
+        """
 
     def _scrubber_style(self) -> str:
         return f"""
