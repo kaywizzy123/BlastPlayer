@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QSettings
 from PyQt5.QtGui import (
-    QKeySequence,
+    QKeySequence, QPainter, QPen, QColor,
     QPixmap, QFont, QDragEnterEvent, QDropEvent, QIcon,
     QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer,
     QSurfaceFormat, QOpenGLVertexArrayObject,
@@ -243,6 +243,8 @@ class ScrubberSlider(QSlider):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._groove_pressed = False
+        self._in_frame  = None   # int | None
+        self._out_frame = None   # int | None
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -294,6 +296,51 @@ class ScrubberSlider(QSlider):
         return QStyle.sliderValueFromPosition(
             self.minimum(), self.maximum(), rel_pos, span,
             self.invertedAppearance())
+
+    def set_in_out(self, in_frame, out_frame):
+        self._in_frame  = in_frame
+        self._out_frame = out_frame
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._in_frame is None and self._out_frame is None:
+            return
+
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+        handle = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+        span   = groove.width() - handle.width()
+        offset = groove.x() + handle.width() // 2
+        gy     = groove.center().y()
+
+        def x_for(val):
+            return offset + QStyle.sliderPositionFromValue(
+                self.minimum(), self.maximum(), val, span)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+
+        # Tinted range between in and out
+        x_in  = x_for(self._in_frame  if self._in_frame  is not None else self.minimum())
+        x_out = x_for(self._out_frame if self._out_frame is not None else self.maximum())
+        if x_out > x_in:
+            painter.fillRect(x_in, gy - 3, x_out - x_in, 6, QColor(255, 170, 0, 90))
+
+        # In-point marker (green)
+        if self._in_frame is not None:
+            painter.setPen(QPen(QColor("#4CAF50"), 2))
+            x = x_for(self._in_frame)
+            painter.drawLine(x, gy - 7, x, gy + 7)
+
+        # Out-point marker (orange-red)
+        if self._out_frame is not None:
+            painter.setPen(QPen(QColor("#FF6B35"), 2))
+            x = x_for(self._out_frame)
+            painter.drawLine(x, gy - 7, x, gy + 7)
+
+        painter.end()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -602,6 +649,10 @@ class PlayerWidget(QWidget):
         self._reverse_cache   = []      # list of (frame_num, raw_bytes), pop() = backward
         self._cache_building  = False   # True while background thread is filling cache
 
+        # In / out points
+        self._in_frame  = None   # int | None
+        self._out_frame = None   # int | None
+
         # Audio
         self._volume          = 100
         self._pre_mute_volume = 100   # volume restored when un-muting
@@ -656,6 +707,9 @@ class PlayerWidget(QWidget):
         self._scrubber.setValue(0)
         self._scrubber.blockSignals(False)
 
+        self._in_frame  = None
+        self._out_frame = None
+        self._scrubber.set_in_out(None, None)
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._show_frame(0)
@@ -665,6 +719,47 @@ class PlayerWidget(QWidget):
 
     def stop(self):
         self._cleanup()
+
+    # ------------------------------------------------------------------ #
+    #  In / Out points                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _effective_in(self) -> int:
+        return self._in_frame if self._in_frame is not None else 0
+
+    def _effective_out(self) -> int:
+        return self._out_frame if self._out_frame is not None else max(0, self._total_frames - 1)
+
+    def set_in_frame(self):
+        if not self._path:
+            return
+        f = self._current_frame
+        if self._in_frame is not None and f == self._in_frame:
+            # Toggle off: clear in point
+            self._in_frame = None
+        elif self._out_frame is not None and f >= self._out_frame:
+            return  # invalid: in must be before out
+        else:
+            self._in_frame = f
+        self._scrubber.set_in_out(self._in_frame, self._out_frame)
+
+    def set_out_frame(self):
+        if not self._path:
+            return
+        f = self._current_frame
+        if self._out_frame is not None and f == self._out_frame:
+            # Toggle off: clear out point
+            self._out_frame = None
+        elif self._in_frame is not None and f <= self._in_frame:
+            return  # invalid: out must be after in
+        else:
+            self._out_frame = f
+        self._scrubber.set_in_out(self._in_frame, self._out_frame)
+
+    def clear_in_out(self):
+        self._in_frame  = None
+        self._out_frame = None
+        self._scrubber.set_in_out(None, None)
 
     # ------------------------------------------------------------------ #
     #  FFmpeg frame helpers                                                #
@@ -1198,10 +1293,10 @@ class PlayerWidget(QWidget):
     def _play(self, reverse: bool = False):
         if not self._path:
             return
-        if not reverse and self._current_frame >= self._total_frames - 1:
-            self._seek_no_render(0)
-        if reverse and self._current_frame <= 0:
-            self._seek_no_render(self._total_frames - 1)
+        if not reverse and self._current_frame >= self._effective_out():
+            self._seek_no_render(self._effective_in())
+        if reverse and self._current_frame <= self._effective_in():
+            self._seek_no_render(self._effective_out())
 
         self._is_playing   = True
         self._play_reverse = reverse
@@ -1243,10 +1338,11 @@ class PlayerWidget(QWidget):
             # ── Reverse ───────────────────────────────────────────────── #
             if self._frame_cache is not None:
                 # Fast path: serve directly from RAM cache — no batch decode
+                in_f       = self._effective_in()
                 next_frame = self._current_frame - 1
-                if next_frame < 0:
+                if next_frame < in_f:
                     if self._loop:
-                        last = len(self._frame_cache) - 1
+                        last = min(self._effective_out(), len(self._frame_cache) - 1)
                         self._current_frame = last
                         self._render_raw(self._frame_cache[last])
                         self._scrubber.blockSignals(True)
@@ -1262,9 +1358,10 @@ class PlayerWidget(QWidget):
             else:
                 # Batch-decode path (used when RAM cache isn't available)
                 if not self._reverse_cache and not self._cache_building:
-                    if self._current_frame <= 0:
+                    in_f = self._effective_in()
+                    if self._current_frame <= in_f:
                         if self._loop:
-                            self._seek_no_render(self._total_frames - 1)
+                            self._seek_no_render(self._effective_out())
                             self._reverse_cache = []
                             self._scrubber.blockSignals(True)
                             self._scrubber.setValue(self._current_frame)
@@ -1296,17 +1393,19 @@ class PlayerWidget(QWidget):
 
             if self._frame_cache is not None:
                 # ── Cache mode ──────────────────────────────────────── #
-                if target_frame >= len(self._frame_cache):
+                out  = min(self._effective_out(), len(self._frame_cache) - 1)
+                in_f = self._effective_in()
+                if target_frame > out:
                     if self._loop:
                         self._stop_audio()
-                        self._play_frame_start = 0
+                        self._play_frame_start = in_f
                         self._play_clock_start = time.monotonic()
-                        self._current_frame    = 0
-                        self._pipe_frame       = 1
-                        self._render_raw(self._frame_cache[0])
+                        self._current_frame    = in_f
+                        self._pipe_frame       = in_f + 1
+                        self._render_raw(self._frame_cache[in_f])
                         self._start_audio()
                         self._scrubber.blockSignals(True)
-                        self._scrubber.setValue(0)
+                        self._scrubber.setValue(in_f)
                         self._scrubber.blockSignals(False)
                         self._update_info()
                     else:
@@ -1322,8 +1421,10 @@ class PlayerWidget(QWidget):
 
             else:
                 # ── Pipe mode ───────────────────────────────────────── #
-                raw = None
-                eof = False
+                out         = self._effective_out()
+                raw         = None
+                eof         = False
+                out_reached = False
                 while self._pipe_frame <= target_frame:
                     try:
                         item = self._frame_queue.get_nowait()
@@ -1334,54 +1435,70 @@ class PlayerWidget(QWidget):
                         break
                     raw = item
                     self._pipe_frame += 1
+                    if self._out_frame is not None and self._pipe_frame - 1 >= out:
+                        out_reached = True
+                        break
 
-                if eof:
+                if eof or out_reached:
                     if raw is not None:
                         self._render_raw(raw)
                         self._current_frame = self._pipe_frame - 1
+                    in_f = self._effective_in()
                     if self._loop:
                         self._stop_audio()
-                        if self._loop_pipe_proc is not None:
-                            # Seamless swap: adopt the pre-warmed loop pipe
-                            self._reader_stop.set()
-                            self._reader_thread = None
-                            while True:
-                                try:
-                                    self._frame_queue.get_nowait()
-                                except queue.Empty:
-                                    break
-                            if self._pipe_proc is not None:
-                                try:
-                                    self._pipe_proc.stdout.close()
-                                    self._pipe_proc.terminate()
-                                except Exception:
-                                    pass
-                                self._pipe_proc = None
-                            self._pipe_proc     = self._loop_pipe_proc
-                            self._frame_queue   = self._loop_pipe_queue
-                            self._reader_thread = self._loop_pipe_thread
-                            self._reader_stop   = self._loop_reader_stop
-                            self._pipe_frame    = 0
-                            self._loop_pipe_proc   = None
-                            self._loop_pipe_queue  = None
-                            self._loop_pipe_thread = None
-                            self._loop_reader_stop = threading.Event()
-                            if self._loop_frame0 is not None:
-                                self._render_raw(self._loop_frame0)
-                                self._loop_frame0 = None
+                        if out_reached or in_f > 0:
+                            # Range loop or non-zero in point: simple re-seek
+                            self._open_pipe(in_f)
+                            self._current_frame    = in_f
+                            self._play_frame_start = in_f
+                            self._play_clock_start = time.monotonic()
+                            self._start_audio()
+                            self._scrubber.blockSignals(True)
+                            self._scrubber.setValue(in_f)
+                            self._scrubber.blockSignals(False)
+                            self._update_info()
                         else:
-                            raw0 = self._loop_frame0
-                            self._open_pipe(0)
-                            if raw0 is not None:
-                                self._render_raw(raw0)
-                        self._current_frame    = 0
-                        self._play_frame_start = 0
-                        self._play_clock_start = time.monotonic()
-                        self._start_audio()
-                        self._scrubber.blockSignals(True)
-                        self._scrubber.setValue(0)
-                        self._scrubber.blockSignals(False)
-                        self._update_info()
+                            # True EOF, in_f == 0: seamless loop-pipe swap
+                            if self._loop_pipe_proc is not None:
+                                self._reader_stop.set()
+                                self._reader_thread = None
+                                while True:
+                                    try:
+                                        self._frame_queue.get_nowait()
+                                    except queue.Empty:
+                                        break
+                                if self._pipe_proc is not None:
+                                    try:
+                                        self._pipe_proc.stdout.close()
+                                        self._pipe_proc.terminate()
+                                    except Exception:
+                                        pass
+                                    self._pipe_proc = None
+                                self._pipe_proc     = self._loop_pipe_proc
+                                self._frame_queue   = self._loop_pipe_queue
+                                self._reader_thread = self._loop_pipe_thread
+                                self._reader_stop   = self._loop_reader_stop
+                                self._pipe_frame    = 0
+                                self._loop_pipe_proc   = None
+                                self._loop_pipe_queue  = None
+                                self._loop_pipe_thread = None
+                                self._loop_reader_stop = threading.Event()
+                                if self._loop_frame0 is not None:
+                                    self._render_raw(self._loop_frame0)
+                                    self._loop_frame0 = None
+                            else:
+                                raw0 = self._loop_frame0
+                                self._open_pipe(0)
+                                if raw0 is not None:
+                                    self._render_raw(raw0)
+                            self._current_frame    = 0
+                            self._play_frame_start = 0
+                            self._play_clock_start = time.monotonic()
+                            self._start_audio()
+                            self._scrubber.blockSignals(True)
+                            self._scrubber.setValue(0)
+                            self._scrubber.blockSignals(False)
+                            self._update_info()
                     else:
                         self._pause()
                     return
@@ -1389,8 +1506,9 @@ class PlayerWidget(QWidget):
                 if raw is not None:
                     self._render_raw(raw)
                     self._current_frame = self._pipe_frame - 1
-                    if self._loop and self._total_frames > 0:
-                        remaining = self._total_frames - self._current_frame
+                    # Only pre-warm loop pipe when playing to actual end (in_f == 0)
+                    if self._loop and self._total_frames > 0 and self._effective_in() == 0:
+                        remaining = self._effective_out() - self._current_frame
                         if remaining <= self._LOOKAHEAD_FRAMES:
                             if self._loop_frame0 is None:
                                 self._open_lookahead()
@@ -1705,6 +1823,9 @@ class PlayerWidget(QWidget):
         elif k == Qt.Key_Right and not ctrl:     self._step_forward()
         elif k == Qt.Key_Home:                   self._go_first()
         elif k == Qt.Key_End:                    self._go_last()
+        elif k == Qt.Key_BracketLeft:            self.set_in_frame()
+        elif k == Qt.Key_BracketRight:           self.set_out_frame()
+        elif k == Qt.Key_Backslash and ctrl:     self.clear_in_out()
         elif k == Qt.Key_Equal and ctrl:         self.zoom_in()
         elif k == Qt.Key_Minus and ctrl:         self.zoom_out()
         elif k == Qt.Key_0     and ctrl:         self.zoom_reset()
@@ -1731,6 +1852,9 @@ class PlayerWidget(QWidget):
         self._cache_loading    = False
         self._play_clock_start = 0.0
         self._play_frame_start = 0
+        self._in_frame  = None
+        self._out_frame = None
+        self._scrubber.set_in_out(None, None)
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._canvas.clear_frame()
@@ -1869,6 +1993,18 @@ class BlastPlayerWindow(QMainWindow):
         self._loop_on_scrub_act.setCheckable(True)
         self._loop_on_scrub_act.triggered.connect(
             lambda c: setattr(self._player, "_loop_on_scrub", c))
+        pb.addSeparator()
+        io_menu = pb.addMenu("In / Out")
+        set_in_act = io_menu.addAction("Set In Point")
+        set_in_act.setShortcut("[")
+        set_in_act.triggered.connect(self._player.set_in_frame)
+        set_out_act = io_menu.addAction("Set Out Point")
+        set_out_act.setShortcut("]")
+        set_out_act.triggered.connect(self._player.set_out_frame)
+        io_menu.addSeparator()
+        clear_io_act = io_menu.addAction("Clear In / Out")
+        clear_io_act.setShortcut("Ctrl+\\")
+        clear_io_act.triggered.connect(self._player.clear_in_out)
 
         # Audio
         am = mb.addMenu("Audio")
