@@ -60,7 +60,8 @@ try:
         glTexParameteri, glActiveTexture, glUniform1i,
         GL_COLOR_BUFFER_BIT, GL_TRIANGLES, GL_FLOAT,
         GL_TEXTURE_2D, GL_TEXTURE_3D,
-        GL_RGB, GL_RGBA, GL_RGB16, GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT,
+        GL_RGB, GL_RGBA, GL_RGB8, GL_RGB16, GL_RGBA32F,
+        GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT,
         GL_TEXTURE0, GL_TEXTURE1,
         GL_LINEAR, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
         GL_CLAMP_TO_EDGE, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
@@ -738,7 +739,7 @@ void main() {
                 glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
                 glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
                 glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)
-                glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA, w, h, h, 0,
+                glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA32F, w, h, h, 0,
                              GL_RGBA, GL_FLOAT, data)
                 glBindTexture(GL_TEXTURE_3D, 0)
             else:
@@ -747,7 +748,7 @@ void main() {
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0,
                              GL_RGBA, GL_FLOAT, data)
                 glBindTexture(GL_TEXTURE_2D, 0)
             lut_info.append((sampler, tid, is_3d))
@@ -808,7 +809,7 @@ void main() {
                 if self._is_hdr:
                     int_fmt, gl_type = GL_RGB16, GL_UNSIGNED_SHORT
                 else:
-                    int_fmt, gl_type = GL_RGB, GL_UNSIGNED_BYTE
+                    int_fmt, gl_type = GL_RGB8, GL_UNSIGNED_BYTE
                 if w != self._tex_w or h != self._tex_h or self._is_hdr != getattr(self, '_tex_hdr', False):
                     glTexImage2D(GL_TEXTURE_2D, 0, int_fmt, w, h, 0,
                                  GL_RGB, gl_type, self._frame_raw)
@@ -913,7 +914,7 @@ void main() {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16, w, h, 0,
                              GL_RGB, GL_UNSIGNED_SHORT, None)
             else:
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0,
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, w, h, 0,
                              GL_RGB, GL_UNSIGNED_BYTE, None)
         glBindTexture(GL_TEXTURE_2D, 0)
 
