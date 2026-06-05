@@ -44,14 +44,19 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QSettings
 from PyQt5.QtGui import (
     QKeySequence,
-    QImage, QPixmap, QFont, QDragEnterEvent, QDropEvent, QIcon,
+    QPixmap, QFont, QDragEnterEvent, QDropEvent, QIcon,
     QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer,
-    QOpenGLTexture, QSurfaceFormat,
+    QSurfaceFormat, QOpenGLVertexArrayObject,
 )
 try:
     from OpenGL.GL import (
         glClearColor, glClear, glViewport, glDrawArrays,
+        glGenTextures, glBindTexture, glTexImage2D, glTexSubImage2D,
+        glTexParameteri, glActiveTexture,
         GL_COLOR_BUFFER_BIT, GL_TRIANGLES, GL_FLOAT,
+        GL_TEXTURE_2D, GL_RGB, GL_UNSIGNED_BYTE, GL_TEXTURE0,
+        GL_LINEAR, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
+        GL_CLAMP_TO_EDGE, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
     )
 except ImportError:
     raise SystemExit(
@@ -304,7 +309,9 @@ class VideoCanvas(QOpenGLWidget):
     zoom_scrolled = pyqtSignal(int)       # +1 = in, -1 = out
     pan_dragged   = pyqtSignal(int, int)  # dx, dy
 
+    # GLSL 1.20 — works on both compatibility and core profiles
     _VERT = """
+        #version 120
         attribute vec2 a_pos;
         attribute vec2 a_tex;
         varying   vec2 v_tex;
@@ -314,17 +321,19 @@ class VideoCanvas(QOpenGLWidget):
         }
     """
     _FRAG = """
+        #version 120
         uniform sampler2D u_frame;
         varying vec2 v_tex;
         void main() {
-            // flip V: QImage row-0 = top, GL row-0 = bottom
-            gl_FragColor = texture2D(u_frame, vec2(v_tex.x, 1.0 - v_tex.y));
+            gl_FragColor = texture2D(u_frame, v_tex);
         }
     """
 
     def __init__(self, parent=None):
         fmt = QSurfaceFormat()
-        fmt.setSwapInterval(0)          # no vsync — timer drives frame rate
+        fmt.setSwapInterval(0)                      # no vsync — timer drives frame rate
+        fmt.setVersion(2, 1)
+        fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
         QSurfaceFormat.setDefaultFormat(fmt)
         super().__init__(parent)
 
@@ -338,9 +347,12 @@ class VideoCanvas(QOpenGLWidget):
         self._drag_pos  = None
 
         # GL objects — initialised in initializeGL
-        self._prog      = None
-        self._vbo       = None
-        self._texture   = None
+        self._vao       = None          # QOpenGLVertexArrayObject
+        self._prog      = None          # QOpenGLShaderProgram
+        self._vbo       = None          # QOpenGLBuffer
+        self._tex_id    = None          # raw GL texture name (int)
+        self._tex_w     = 0             # dimensions of currently allocated texture
+        self._tex_h     = 0
 
     # ── Public API ───────────────────────────────────────────────────── #
 
@@ -364,6 +376,10 @@ class VideoCanvas(QOpenGLWidget):
     # ── OpenGL callbacks ─────────────────────────────────────────────── #
 
     def initializeGL(self):
+        # VAO — required in core profile; harmless in compatibility profile
+        self._vao = QOpenGLVertexArrayObject(self)
+        self._vao.create()
+
         self._prog = QOpenGLShaderProgram(self)
         self._prog.addShaderFromSourceCode(QOpenGLShader.Vertex,   self._VERT)
         self._prog.addShaderFromSourceCode(QOpenGLShader.Fragment, self._FRAG)
@@ -376,10 +392,14 @@ class VideoCanvas(QOpenGLWidget):
         self._vbo.create()
         self._vbo.setUsagePattern(QOpenGLBuffer.DynamicDraw)
 
-        self._texture = QOpenGLTexture(QOpenGLTexture.Target2D)
-        self._texture.setMinificationFilter(QOpenGLTexture.Linear)
-        self._texture.setMagnificationFilter(QOpenGLTexture.Linear)
-        self._texture.setWrapMode(QOpenGLTexture.ClampToEdge)
+        # Raw GL texture (glTexImage2D/glTexSubImage2D for clean size-change handling)
+        self._tex_id = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D, self._tex_id)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D, 0)
 
         glClearColor(0, 0, 0, 1)
 
@@ -392,10 +412,20 @@ class VideoCanvas(QOpenGLWidget):
         if not self._frame_raw or not self._vid_w or self._prog is None:
             return
 
+        # Upload new frame bytes to the GPU texture
         if self._dirty:
-            qimg = QImage(self._frame_raw, self._vid_w, self._vid_h,
-                          self._vid_w * 3, QImage.Format_RGB888)
-            self._texture.setData(qimg, QOpenGLTexture.DontGenerateMipMaps)
+            w, h = self._vid_w, self._vid_h
+            glBindTexture(GL_TEXTURE_2D, self._tex_id)
+            if w != self._tex_w or h != self._tex_h:
+                # First frame or resolution change: allocate new storage
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0,
+                             GL_RGB, GL_UNSIGNED_BYTE, self._frame_raw)
+                self._tex_w, self._tex_h = w, h
+            else:
+                # Same size: update in-place (much faster than reallocating)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                                GL_RGB, GL_UNSIGNED_BYTE, self._frame_raw)
+            glBindTexture(GL_TEXTURE_2D, 0)
             self._dirty = False
 
         verts = self._quad_vertices()
@@ -404,11 +434,14 @@ class VideoCanvas(QOpenGLWidget):
 
         buf = array.array('f', verts)
         raw = buf.tobytes()
+
+        self._vao.bind()
         self._vbo.bind()
         self._vbo.allocate(raw, len(raw))
 
         self._prog.bind()
-        self._texture.bind(0)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self._tex_id)
         self._prog.setUniformValue("u_frame", 0)
 
         stride = 4 * 4                  # 4 floats × 4 bytes
@@ -421,9 +454,10 @@ class VideoCanvas(QOpenGLWidget):
 
         self._prog.disableAttributeArray(0)
         self._prog.disableAttributeArray(1)
-        self._texture.release()
+        glBindTexture(GL_TEXTURE_2D, 0)
         self._prog.release()
         self._vbo.release()
+        self._vao.release()
 
     # ── Quad geometry ────────────────────────────────────────────────── #
 
