@@ -77,9 +77,10 @@ class AudioEngine(QObject):
     SCRUB_MIN_GAP = 0.06    # 60 ms
 
     # Modes used inside the audio callback
-    _STOPPED    = 0
-    _PLAYING    = 1
-    _SCRUBBING  = 2
+    _STOPPED          = 0
+    _PLAYING          = 1
+    _SCRUBBING        = 2
+    _PLAYING_REVERSE  = 3   # reads PCM buffer backwards — classic "tape rewind" sound
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -254,6 +255,19 @@ class AudioEngine(QObject):
         """Halt all audio output."""
         self._mode = self._STOPPED
 
+    def play_reverse(self, frame: int) -> None:
+        """
+        Start continuous reverse playback from *frame* going backwards.
+
+        The PCM buffer is read right-to-left each callback block, producing
+        the characteristic reversed-tape sound animators use to check timing.
+        """
+        if self._pcm is None:
+            return
+        # _play_pos is the exclusive upper bound of the next block to read.
+        self._play_pos = min(self._frame_to_sample(frame) + 1, len(self._pcm))
+        self._mode = self._PLAYING_REVERSE
+
     def scrub(self, frame: int) -> None:
         """
         Play a short audio snippet at *frame* for scrub drag feedback.
@@ -357,6 +371,22 @@ class AudioEngine(QObject):
                 outdata[n:] = 0
                 self._mode = self._STOPPED
             self._play_pos = actual_end
+
+        elif mode == self._PLAYING_REVERSE:
+            pos   = self._play_pos   # exclusive upper bound
+            start = pos - frames
+            if pos <= 0:
+                outdata[:] = 0
+                self._mode = self._STOPPED
+                return
+            actual_start = max(0, start)
+            n = pos - actual_start
+            # Read the slice in reverse: index [pos-1, pos-2, ..., actual_start]
+            np.multiply(pcm[actual_start:pos][::-1], vol, out=outdata[:n])
+            if n < frames:
+                outdata[n:] = 0
+                self._mode = self._STOPPED
+            self._play_pos = actual_start
 
         elif mode == self._SCRUBBING:
             pos = self._scrub_pos

@@ -2112,14 +2112,15 @@ class PlayerWidget(QWidget):
 
         self._play_frame_start = self._current_frame
         self._play_clock_start = time.monotonic()
-        if not reverse:
-            if self._mc_idx >= 0 and self._mc_clips:
-                global_frame = self._mc_offset() + self._current_frame
-                sample = self._audio.global_frame_to_sample(global_frame, self._mc_clips)
-                self._audio._play_pos = sample
-                self._audio._mode = AudioEngine._PLAYING
-            else:
-                self._audio.play(self._current_frame)
+        if reverse:
+            self._audio.play_reverse(self._current_frame)
+        elif self._mc_idx >= 0 and self._mc_clips:
+            global_frame = self._mc_offset() + self._current_frame
+            sample = self._audio.global_frame_to_sample(global_frame, self._mc_clips)
+            self._audio._play_pos = sample
+            self._audio._mode = AudioEngine._PLAYING
+        else:
+            self._audio.play(self._current_frame)
 
         interval = max(1, int(1000 / (self._fps * self._speed)))
         self._timer.start(interval)
@@ -2150,6 +2151,7 @@ class PlayerWidget(QWidget):
                         last = min(self._effective_out(), len(self._frame_cache) - 1)
                         self._current_frame = last
                         self._render_raw(self._frame_cache[last])
+                        self._audio.play_reverse(last)
                         self._scrubber.blockSignals(True)
                         self._scrubber.setValue(last)
                         self._scrubber.blockSignals(False)
@@ -2168,6 +2170,7 @@ class PlayerWidget(QWidget):
                         if self._loop:
                             self._seek_no_render(self._effective_out())
                             self._reverse_cache = []
+                            self._audio.play_reverse(self._current_frame)
                             self._scrubber.blockSignals(True)
                             self._scrubber.setValue(self._current_frame)
                             self._scrubber.blockSignals(False)
@@ -2490,7 +2493,10 @@ class PlayerWidget(QWidget):
                 self._open_pipe(self._current_frame)
             self._play_frame_start = self._current_frame
             self._play_clock_start = time.monotonic()
-            self._audio.play(self._current_frame)
+            if self._play_reverse:
+                self._audio.play_reverse(self._current_frame)
+            else:
+                self._audio.play(self._current_frame)
             self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
         else:
             self._close_scrub_pipe()
