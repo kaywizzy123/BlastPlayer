@@ -2440,7 +2440,7 @@ class PlayerWidget(QWidget):
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._audio.stop()
-        self._refresh_display()
+        self._show_frame(self._current_frame)
 
     def _on_tick(self):
         if not self._path:
