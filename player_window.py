@@ -36,6 +36,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from core.audio_engine import AudioEngine
+
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QLabel,
@@ -1081,8 +1083,6 @@ class PlayerWidget(QWidget):
         # Multi-clip timeline
         self._mc_clips           = []   # list of {path, fps, total_frames, width, height, offset}
         self._mc_idx             = -1   # -1 = single-clip mode
-        self._mc_audio_proc      = None   # single ffplay covering all clips via concat
-        self._mc_audio_list_path = None   # temp file path for the ffconcat list
         self._mc_next_proc   = None           # pre-warmed pipe for the next clip
         self._mc_next_queue  = None
         self._mc_next_thread = None
@@ -1095,14 +1095,9 @@ class PlayerWidget(QWidget):
         # Audio
         self._volume          = 100
         self._pre_mute_volume = 100   # volume restored when un-muting
-        self._audio_proc      = None
-        self._audio_scrub_enabled = False
-        self._scrub_proc      = None
-
-        # Scrub debounce
-        self._scrub_debounce = QTimer(self)
-        self._scrub_debounce.setSingleShot(True)
-        self._scrub_debounce.timeout.connect(self._play_scrub_audio)
+        self._audio_scrub_enabled = True   # always on with the new engine
+        self._audio = AudioEngine(self)
+        self._audio.set_volume(self._volume)
 
         # Scrub-ahead seek debounce — pre-warms ffmpeg pipe at drag target
         self._scrub_seek_debounce = QTimer(self)
@@ -1163,6 +1158,7 @@ class PlayerWidget(QWidget):
         self._play_btn.setText("")
         self._show_frame(0)
         self._update_info()
+        self._audio.load(path, self._fps)
         self._start_cache_build()
         if self._autoplay:
             self._play()
@@ -1282,9 +1278,8 @@ class PlayerWidget(QWidget):
         self._scrubber.setValue(0)
         self._scrubber.blockSignals(False)
         self._frames_lbl.setText(f"{total} frames")
-        # Switch from single-clip audio to the continuous concat stream
-        self._stop_audio()
-        self._start_mc_audio()
+        # Reload audio engine with the full multi-clip sequence
+        self._audio.load(clips[0]['path'], clips[0]['fps'], mc_clips=clips)
         # Pre-warm clip 1's video pipe while clip 0 plays
         if len(clips) > 1:
             self._open_mc_next_pipe(clips[1])
@@ -2119,9 +2114,12 @@ class PlayerWidget(QWidget):
         self._play_clock_start = time.monotonic()
         if not reverse:
             if self._mc_idx >= 0 and self._mc_clips:
-                self._start_mc_audio()
+                global_frame = self._mc_offset() + self._current_frame
+                sample = self._audio.global_frame_to_sample(global_frame, self._mc_clips)
+                self._audio._play_pos = sample
+                self._audio._mode = AudioEngine._PLAYING
             else:
-                self._start_audio()
+                self._audio.play(self._current_frame)
 
         interval = max(1, int(1000 / (self._fps * self._speed)))
         self._timer.start(interval)
@@ -2134,8 +2132,7 @@ class PlayerWidget(QWidget):
         self._close_loop_pipe()
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
-        self._stop_mc_audio()
-        self._stop_audio()
+        self._audio.stop()
         self._refresh_display()
 
     def _on_tick(self):
@@ -2206,13 +2203,12 @@ class PlayerWidget(QWidget):
                 if target_frame > out:
                     if self._loop and self._mc_idx < 0:
                         # Single-clip loop
-                        self._stop_audio()
                         self._play_frame_start = in_f
                         self._play_clock_start = time.monotonic()
                         self._current_frame    = in_f
                         self._pipe_frame       = in_f + 1
                         self._render_raw(self._frame_cache[in_f])
-                        self._start_audio()
+                        self._audio.play(in_f)
                         self._scrubber.blockSignals(True)
                         self._scrubber.setValue(in_f)
                         self._scrubber.blockSignals(False)
@@ -2254,14 +2250,13 @@ class PlayerWidget(QWidget):
                         self._current_frame = self._pipe_frame - 1
                     in_f = self._effective_in()
                     if self._loop and self._mc_idx < 0:
-                        self._stop_audio()
                         if out_reached or in_f > 0:
                             # Range loop or non-zero in point: simple re-seek
                             self._open_pipe(in_f)
                             self._current_frame    = in_f
                             self._play_frame_start = in_f
                             self._play_clock_start = time.monotonic()
-                            self._start_audio()
+                            self._audio.play(in_f)
                             self._scrubber.blockSignals(True)
                             self._scrubber.setValue(in_f)
                             self._scrubber.blockSignals(False)
@@ -2303,7 +2298,7 @@ class PlayerWidget(QWidget):
                             self._current_frame    = 0
                             self._play_frame_start = 0
                             self._play_clock_start = time.monotonic()
-                            self._start_audio()
+                            self._audio.play(0)
                             self._scrubber.blockSignals(True)
                             self._scrubber.setValue(0)
                             self._scrubber.blockSignals(False)
@@ -2416,11 +2411,10 @@ class PlayerWidget(QWidget):
 
     def _on_scrubber_pressed(self):
         self._scrubber_moving = True
+        self._audio.stop()
         if self._is_playing:
             self._timer.stop()
             self._close_pipe()
-            self._stop_mc_audio()
-            self._stop_audio()
 
     def _on_scrubber_released(self):
         self._scrubber_moving = False
@@ -2436,6 +2430,10 @@ class PlayerWidget(QWidget):
                 self.load_video(next_clip['path'])
                 self._mc_clips = clips_backup
                 self._mc_idx   = target_idx
+                # Re-wire the audio engine with the full mc sequence
+                self._audio.load(clips_backup[0]['path'],
+                                 clips_backup[0]['fps'],
+                                 mc_clips=clips_backup)
                 total = sum(c['total_frames'] for c in clips_backup)
                 self._scrubber.blockSignals(True)
                 self._scrubber.setRange(0, max(total - 1, 0))
@@ -2446,7 +2444,6 @@ class PlayerWidget(QWidget):
             # Seek to the local frame within the (now-active) clip
             self._current_frame = local_frame
             if self._is_playing:
-                self._stop_mc_audio()
                 if self._play_reverse:
                     self._reverse_cache = []
                 elif self._frame_cache is not None:
@@ -2455,7 +2452,9 @@ class PlayerWidget(QWidget):
                     self._open_pipe(local_frame)
                 self._play_frame_start = local_frame
                 self._play_clock_start = time.monotonic()
-                self._start_mc_audio()
+                sample = self._audio.global_frame_to_sample(global_val, self._mc_clips)
+                self._audio._play_pos = sample
+                self._audio._mode = AudioEngine._PLAYING
                 self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
             else:
                 self._show_frame(local_frame)
@@ -2466,7 +2465,6 @@ class PlayerWidget(QWidget):
         self._scrub_seek_debounce.stop()
         self._current_frame = global_val
         if self._is_playing:
-            self._stop_audio()
             if self._play_reverse:
                 self._reverse_cache = []
                 self._close_scrub_pipe()
@@ -2492,7 +2490,7 @@ class PlayerWidget(QWidget):
                 self._open_pipe(self._current_frame)
             self._play_frame_start = self._current_frame
             self._play_clock_start = time.monotonic()
-            self._start_audio()
+            self._audio.play(self._current_frame)
             self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
         else:
             self._close_scrub_pipe()
@@ -2514,8 +2512,8 @@ class PlayerWidget(QWidget):
                         self._render_raw(raw)
                 self._current_frame = local_frame
             self._update_info()
-            if self._audio_scrub_enabled:
-                self._scrub_debounce.start(80)
+            # Scrub audio: use global frame so position is correct across clips
+            self._audio.scrub(value)  # AudioEngine maps global→sample internally
             return
         # Single-clip mode
         if self._frame_cache and value < len(self._frame_cache):
@@ -2526,8 +2524,7 @@ class PlayerWidget(QWidget):
                 self._render_raw(raw)
         self._current_frame = value
         self._update_info()
-        if self._audio_scrub_enabled:
-            self._scrub_debounce.start(80)
+        self._audio.scrub(value)
         if not self._play_reverse and not self._frame_cache:
             self._scrub_seek_debounce.start(120)
 
@@ -2571,7 +2568,7 @@ class PlayerWidget(QWidget):
                 if self._loop:
                     next_idx = 0
                 else:
-                    self._stop_mc_audio()   # stop before resetting mc state
+                    self._audio.stop()
                     self._mc_clips = []
                     self._mc_idx   = -1
                     self._pause()
@@ -2602,99 +2599,6 @@ class PlayerWidget(QWidget):
     #  Audio                                                               #
     # ------------------------------------------------------------------ #
 
-    def _start_audio(self):
-        self._stop_audio()
-        ffplay = _ffplay_exe()
-        if not Path(ffplay).exists():
-            return
-        seek = self._current_frame / self._fps
-        cmd = [ffplay, "-nodisp", "-autoexit",
-               "-ss",     f"{seek:.4f}",
-               "-volume", str(self._volume),
-               self._path]
-        try:
-            self._audio_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            print(f"[BlastPlayer] audio: {exc}")
-
-    def _stop_audio(self):
-        if self._audio_proc and self._audio_proc.poll() is None:
-            self._audio_proc.terminate()
-        self._audio_proc = None
-
-    def _start_mc_audio(self):
-        """Start one ffplay process covering the full multi-clip sequence via concat."""
-        self._stop_mc_audio()
-        if not self._mc_clips or self._mc_idx < 0:
-            return
-        ffplay = _ffplay_exe()
-        if not Path(ffplay).exists():
-            return
-        # Seek = sum of all completed clips + position inside current clip
-        seek = sum(c['total_frames'] / c['fps'] for c in self._mc_clips[:self._mc_idx])
-        seek += self._current_frame / self._fps
-        # Write ffconcat list (forward-slash paths for cross-platform safety)
-        try:
-            f = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.txt', delete=False, encoding='utf-8')
-            f.write("ffconcat version 1.0\n")
-            for clip in self._mc_clips:
-                safe = clip['path'].replace('\\', '/')
-                f.write(f"file '{safe}'\n")
-            f.close()
-            self._mc_audio_list_path = f.name
-        except Exception as exc:
-            print(f"[BlastPlayer] mc_audio list: {exc}")
-            return
-        cmd = [ffplay, "-nodisp", "-autoexit", "-vn",
-               "-f", "concat", "-safe", "0",
-               "-i", self._mc_audio_list_path,
-               "-ss", f"{seek:.4f}",
-               "-volume", str(self._volume)]
-        try:
-            self._mc_audio_proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as exc:
-            print(f"[BlastPlayer] mc_audio: {exc}")
-
-    def _stop_mc_audio(self):
-        if self._mc_audio_proc and self._mc_audio_proc.poll() is None:
-            self._mc_audio_proc.terminate()
-        self._mc_audio_proc = None
-        if self._mc_audio_list_path:
-            try:
-                os.unlink(self._mc_audio_list_path)
-            except Exception:
-                pass
-            self._mc_audio_list_path = None
-
-    def _play_scrub_audio(self):
-        """Short audio snippet at current frame for scrub feedback."""
-        if not self._path:
-            return
-        ffplay = _ffplay_exe()
-        if not Path(ffplay).exists():
-            return
-        if self._scrub_proc and self._scrub_proc.poll() is None:
-            self._scrub_proc.terminate()
-        seek = self._current_frame / self._fps
-        try:
-            self._scrub_proc = subprocess.Popen(
-                [ffplay, "-nodisp", "-autoexit",
-                 "-ss",     f"{seek:.4f}",
-                 "-t",      "0.15",
-                 "-volume", str(self._volume),
-                 self._path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
-
     def _toggle_mute(self):
         if self._volume > 0:
             self._pre_mute_volume = self._volume
@@ -2707,13 +2611,7 @@ class PlayerWidget(QWidget):
         self._vol_lbl.setText(f"{value}%")
         icon = "mute.png" if value == 0 else "volume-up.png"
         self._vol_btn.setIcon(_icon(icon))
-        if self._is_playing:
-            if self._mc_idx >= 0 and self._mc_clips:
-                self._stop_mc_audio()
-                self._start_mc_audio()
-            else:
-                self._stop_audio()
-                self._start_audio()
+        self._audio.set_volume(value)
 
     # ------------------------------------------------------------------ #
     #  Info update / frame callback                                        #
@@ -2839,7 +2737,7 @@ class PlayerWidget(QWidget):
         self._close_loop_pipe()
         self._close_lookahead()
         self._close_scrub_pipe()
-        self._stop_audio()
+        self._audio.stop()
         self._path             = ""
         self._current_frame    = 0
         self._is_playing       = False
@@ -2855,7 +2753,6 @@ class PlayerWidget(QWidget):
         self._bytes_per_pixel  = 3
         self._play_clock_start = 0.0
         self._play_frame_start = 0
-        self._stop_mc_audio()
         self._close_mc_next_pipe()
         self._mc_clips = []
         self._mc_idx   = -1
@@ -3065,8 +2962,9 @@ class BlastPlayerWindow(QMainWindow):
         am.addSeparator()
         self._scrub_act = am.addAction("Audio Scrubbing")
         self._scrub_act.setCheckable(True)
+        self._scrub_act.setChecked(True)
         self._scrub_act.triggered.connect(
-            lambda checked: setattr(self._player, "_audio_scrub_enabled", checked))
+            lambda checked: setattr(self._player._audio, "_scrub_enabled", checked))
 
         # Color (OCIO)
         cm = mb.addMenu("Color")
@@ -3189,10 +3087,10 @@ class BlastPlayerWindow(QMainWindow):
         self._player._pre_mute_volume = pre_mute
         self._player._vol_slider.setValue(0 if muted else volume)
 
-        # Audio scrubbing
-        scrub = s.value("audioScrubbing", False, type=bool)
-        self._player._audio_scrub_enabled = scrub
+        # Audio scrubbing (always enabled by default with new engine)
+        scrub = s.value("audioScrubbing", True, type=bool)
         self._scrub_act.setChecked(scrub)
+        self._player._audio._scrub_enabled = scrub
 
         # Loop — setChecked triggers _on_loop_toggled which syncs _loop and the menu action
         loop = s.value("loop", False, type=bool)
@@ -3217,7 +3115,7 @@ class BlastPlayerWindow(QMainWindow):
         s.setValue("volume",         self._player._volume)
         s.setValue("preMuteVolume",  self._player._pre_mute_volume)
         s.setValue("muted",          self._player._volume == 0)
-        s.setValue("audioScrubbing", self._player._audio_scrub_enabled)
+        s.setValue("audioScrubbing", getattr(self._player._audio, "_scrub_enabled", True))
         s.setValue("loop",           self._player._loop)
         s.setValue("loopOnStep",     self._player._loop_on_step)
         s.setValue("loopOnScrub",    self._player._loop_on_scrub)
@@ -3358,4 +3256,5 @@ class BlastPlayerWindow(QMainWindow):
         self._save_geometry()
         self._save_settings()
         self._player.stop()
+        self._player._audio.close()
         super().closeEvent(event)
