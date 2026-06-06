@@ -45,12 +45,13 @@ from PyQt5.QtWidgets import (
     QAction, QFileDialog, QMessageBox,
     QFrame, QToolButton, QActionGroup, QComboBox, QShortcut,
     QOpenGLWidget, QListWidget, QListWidgetItem, QMenu, QSplitter,
-    QApplication,
+    QApplication, QLineEdit, QInputDialog,
+    QStyledItemDelegate, QAbstractItemView, QStyle,
 )
-from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QSettings
+from PyQt5.QtCore import Qt, QTimer, QSize, QRect, QThread, pyqtSignal, QSettings
 from PyQt5.QtGui import (
     QKeySequence, QPainter, QPen, QColor,
-    QPixmap, QFont, QDragEnterEvent, QDropEvent, QIcon,
+    QPixmap, QFont, QFontMetrics, QDragEnterEvent, QDropEvent, QIcon,
     QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer,
     QSurfaceFormat, QOpenGLVertexArrayObject,
 )
@@ -195,23 +196,193 @@ def probe_video(path: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Playlist sidebar — helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+_THUMB_W = 80    # thumbnail width  (px)
+_THUMB_H = 45    # thumbnail height (px, ~16:9)
+_ROW_H   = 68    # list-row height  (px)
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as MM:SS or H:MM:SS."""
+    if seconds <= 0:
+        return "--:--"
+    s = int(round(seconds))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class _ThumbnailLoader(QThread):
+    """Extracts the first video frame as a QPixmap in a background thread."""
+    done = pyqtSignal(str, object)   # (path, QPixmap)
+
+    def __init__(self, path: str, parent=None) -> None:
+        super().__init__(parent)
+        self._path = path
+
+    def run(self) -> None:
+        try:
+            proc = subprocess.Popen(
+                [_ffmpeg_exe(), "-y", "-i", self._path,
+                 "-vf", "select=eq(n\\,0)", "-vframes", "1",
+                 "-f", "image2", "-vcodec", "mjpeg", "pipe:1"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            data = proc.stdout.read()
+            proc.wait()
+        except Exception:
+            return
+        if not data:
+            return
+        pix = QPixmap()
+        pix.loadFromData(bytes(data))
+        if pix.isNull():
+            return
+        pix = pix.scaled(_THUMB_W, _THUMB_H,
+                         Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.done.emit(self._path, pix)
+
+
+class _PlaylistDelegate(QStyledItemDelegate):
+    """Renders each row: thumbnail | label + filename + duration/frame info."""
+
+    def __init__(self, sidebar: "PlaylistSidebar", parent=None) -> None:
+        super().__init__(parent)
+        self._sb = sidebar
+
+    def sizeHint(self, _option, _index) -> QSize:
+        return QSize(0, _ROW_H)
+
+    def paint(self, painter, option, index) -> None:
+        painter.save()
+
+        path  = index.data(Qt.UserRole)     or ""
+        meta  = index.data(Qt.UserRole + 1) or {}
+        thumb = index.data(Qt.UserRole + 2)
+
+        selected = bool(option.state & QStyle.State_Selected)
+        playing  = (path == self._sb._current_playing)
+        r        = option.rect
+
+        # ── Background ──────────────────────────────────────────────────
+        if selected:
+            painter.fillRect(r, QColor(constants.ACCENT_HI))
+        elif playing:
+            painter.fillRect(r, QColor("#111d2a"))
+        else:
+            painter.fillRect(r, QColor("#1c1c1c"))
+
+        # Left accent bar for the currently playing clip
+        if playing:
+            painter.fillRect(r.x(), r.y(), 3, r.height(),
+                             QColor(constants.ACCENT_HI))
+
+        # Bottom row separator
+        painter.setPen(QPen(QColor(constants.BORDER)))
+        painter.drawLine(r.bottomLeft(), r.bottomRight())
+
+        # ── Thumbnail ───────────────────────────────────────────────────
+        tx = r.x() + 8
+        ty = r.y() + (r.height() - _THUMB_H) // 2
+        if thumb and not thumb.isNull():
+            ox = (_THUMB_W - thumb.width())  // 2
+            oy = (_THUMB_H - thumb.height()) // 2
+            painter.drawPixmap(tx + ox, ty + oy, thumb)
+        else:
+            slot = QRect(tx, ty, _THUMB_W, _THUMB_H)
+            painter.fillRect(slot, QColor("#252525"))
+            painter.setPen(QPen(QColor("#3c3c3c")))
+            painter.drawRect(slot.adjusted(0, 0, -1, -1))
+
+        # ── Text block ──────────────────────────────────────────────────
+        lx = tx + _THUMB_W + 8
+        lw = r.right() - lx - 6
+
+        t_col = QColor("white")   if selected else QColor(constants.TEXT_PRI)
+        s_col = QColor("#c0d8f8") if selected else QColor(constants.TEXT_SEC)
+
+        label    = meta.get("label",        Path(path).name if path else "")
+        filename = Path(path).name          if path else ""
+        duration = meta.get("duration",     0.0)
+        frames   = meta.get("total_frames", 0)
+        fps      = meta.get("fps",          0.0)
+        loop_on  = meta.get("loop_this",    False)
+
+        # Row 1 — label (bold 9 pt)
+        f = painter.font()
+        f.setPointSize(9)
+        f.setBold(True)
+        painter.setFont(f)
+        painter.setPen(t_col)
+        badge_w  = 22 if loop_on else 0
+        elided   = QFontMetrics(f).elidedText(label, Qt.ElideRight, lw - badge_w)
+        painter.drawText(QRect(lx, r.y() + 8, lw - badge_w, 17),
+                         Qt.AlignLeft | Qt.AlignVCenter, elided)
+
+        # Loop badge (top-right corner of text block)
+        if loop_on:
+            badge = QRect(r.right() - 22, r.y() + 8, 18, 18)
+            painter.fillRect(badge,
+                             QColor(constants.ACCENT_HI) if selected
+                             else QColor("#1b3d5a"))
+            f2 = painter.font()
+            f2.setPointSize(9)
+            f2.setBold(False)
+            painter.setFont(f2)
+            painter.setPen(QColor("white"))
+            painter.drawText(badge, Qt.AlignCenter, "↺")
+
+        # Row 2 — filename in grey (only shown when the label was renamed)
+        f.setBold(False)
+        f.setPointSize(8)
+        painter.setFont(f)
+        painter.setPen(s_col)
+        if label != filename:
+            el2 = QFontMetrics(f).elidedText(filename, Qt.ElideRight, lw)
+            painter.drawText(QRect(lx, r.y() + 27, lw, 14),
+                             Qt.AlignLeft | Qt.AlignVCenter, el2)
+
+        # Row 3 — duration · frame count · fps  (bottom-aligned)
+        parts: list[str] = []
+        if duration > 0:
+            parts.append(_fmt_duration(duration))
+        if frames:
+            parts.append(f"{frames} fr")
+        if fps:
+            parts.append(f"{fps:.4g} fps")
+        info = "  ·  ".join(parts)
+        painter.drawText(QRect(lx, r.bottom() - 20, lw, 16),
+                         Qt.AlignLeft | Qt.AlignVCenter, info)
+
+        painter.restore()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Playlist sidebar
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PlaylistSidebar(QWidget):
-    video_selected           = pyqtSignal(str)    # emitted on double-click (single video)
-    selection_play_requested = pyqtSignal(list)   # emitted when playing a multi-selection
+    video_selected           = pyqtSignal(str)
+    selection_play_requested = pyqtSignal(list)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setMinimumWidth(140)
+        self.setMinimumWidth(220)
         self.setAcceptDrops(True)
-        self._paths            = []
-        self._active_selection = []   # non-empty → advance only within this subset
+
+        self._paths:            list = []
+        self._active_selection: list = []
+        self._current_playing:  str  = ""
+        self._thumb_threads:    dict = {}   # path → _ThumbnailLoader
+
         self._build_ui()
 
-    def _build_ui(self):
+    # ── UI construction ──────────────────────────────────────────────────── #
+
+    def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -219,94 +390,144 @@ class PlaylistSidebar(QWidget):
         # Header bar
         hdr = QWidget()
         hdr.setFixedHeight(34)
-        hdr.setStyleSheet(f"background: {constants.BORDER};")
-        hdr_l = QHBoxLayout(hdr)
-        hdr_l.setContentsMargins(10, 0, 6, 0)
+        hdr.setStyleSheet(f"background:{constants.BORDER};")
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(10, 0, 4, 0)
+        hl.setSpacing(3)
+
         title = QLabel("Playlist")
         title.setStyleSheet(
-            f"color: {constants.TEXT_PRI}; font-size: 12px;"
-            f" font-weight: bold; background: transparent;")
-        hdr_l.addWidget(title)
-        hdr_l.addStretch()
+            f"color:{constants.TEXT_PRI};font-size:12px;"
+            f"font-weight:bold;background:transparent;")
+        hl.addWidget(title)
+        hl.addStretch()
+
+        self._up_btn   = self._mk_hdr_btn("▲", "Move up")
+        self._down_btn = self._mk_hdr_btn("▼", "Move down")
+        self._up_btn.clicked.connect(self._move_up)
+        self._down_btn.clicked.connect(self._move_down)
+        hl.addWidget(self._up_btn)
+        hl.addWidget(self._down_btn)
+        hl.addSpacing(4)
+
         clear_btn = QPushButton("Clear")
-        clear_btn.setFixedHeight(20)
+        clear_btn.setFixedSize(40, 22)
         clear_btn.setFocusPolicy(Qt.NoFocus)
         clear_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {constants.ACCENT}; color: {constants.TEXT_SEC};
-                border: none; border-radius: 3px; font-size: 10px; padding: 0 8px;
-            }}
-            QPushButton:hover {{ background: {constants.ACCENT_HI}; color: white; }}
+            QPushButton{{background:{constants.ACCENT};color:{constants.TEXT_SEC};
+                border:none;border-radius:3px;font-size:10px;}}
+            QPushButton:hover{{background:{constants.ACCENT_HI};color:white;}}
         """)
         clear_btn.clicked.connect(self.clear)
-        hdr_l.addWidget(clear_btn)
+        hl.addWidget(clear_btn)
         root.addWidget(hdr)
 
-        # Video list
+        # Search / filter bar
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search…")
+        self._search.setClearButtonEnabled(True)
+        self._search.setFixedHeight(26)
+        self._search.setStyleSheet(f"""
+            QLineEdit{{background:#141414;color:{constants.TEXT_PRI};
+                border:none;border-bottom:1px solid {constants.BORDER};
+                font-size:11px;padding:0 8px;}}
+            QLineEdit:focus{{border-bottom:1px solid {constants.ACCENT_HI};}}
+        """)
+        self._search.textChanged.connect(self._apply_filter)
+        root.addWidget(self._search)
+
+        # Clip list
         self._list = QListWidget()
-        self._list.setStyleSheet(f"""
-            QListWidget {{
-                background: #1c1c1c;
-                color: {constants.TEXT_PRI};
-                border: none;
-                font-size: 11px;
-                outline: none;
-            }}
-            QListWidget::item {{
-                padding: 7px 10px;
-                border-bottom: 1px solid {constants.BORDER};
-            }}
-            QListWidget::item:selected {{
-                background: {constants.ACCENT_HI};
-                color: white;
-            }}
-            QListWidget::item:hover:!selected {{
-                background: {constants.ACCENT};
-            }}
+        self._list.setItemDelegate(_PlaylistDelegate(self, self._list))
+        self._list.setStyleSheet(
+            "QListWidget{background:#1c1c1c;border:none;outline:none;}"
+            "QListWidget::item{border:none;padding:0;}")
+        self._list.verticalScrollBar().setStyleSheet(f"""
+            QScrollBar:vertical{{background:#1c1c1c;width:5px;border:none;margin:0;}}
+            QScrollBar::handle:vertical{{background:{constants.ACCENT};
+                border-radius:2px;min-height:20px;}}
+            QScrollBar::handle:vertical:hover{{background:{constants.ACCENT_HI};}}
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
         """)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._list.verticalScrollBar().setStyleSheet(f"""
-            QScrollBar:vertical {{
-                background: #1c1c1c; width: 6px; border: none; margin: 0;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {constants.ACCENT}; border-radius: 3px; min-height: 20px;
-            }}
-            QScrollBar::handle:vertical:hover {{ background: {constants.ACCENT_HI}; }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
-        """)
-        # Multi-select + drag-to-reorder
         self._list.setSelectionMode(QListWidget.ExtendedSelection)
         self._list.setDragDropMode(QListWidget.InternalMove)
         self._list.setDefaultDropAction(Qt.MoveAction)
         self._list.model().rowsMoved.connect(self._sync_paths)
-        # Context menu
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_context_menu)
-        # Double-click to play (clears any active sub-selection)
         self._list.itemClicked.connect(self._on_item_clicked)
         root.addWidget(self._list, stretch=1)
 
-    # ── Public API ────────────────────────────────────────────────────── #
+    def _mk_hdr_btn(self, text: str, tip: str) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setFixedSize(22, 22)
+        btn.setFocusPolicy(Qt.NoFocus)
+        btn.setToolTip(tip)
+        btn.setStyleSheet(f"""
+            QPushButton{{background:transparent;color:{constants.TEXT_SEC};
+                border:none;font-size:11px;}}
+            QPushButton:hover{{color:white;background:{constants.ACCENT};
+                border-radius:3px;}}
+        """)
+        return btn
 
-    def add_video(self, path: str):
+    # ── Public API ───────────────────────────────────────────────────────── #
+
+    def add_video(self, path: str) -> None:
         if path in self._paths:
             return
+
+        # Probe for duration / frame metadata (ffprobe, fast)
+        try:
+            info     = probe_video(path)
+            fps      = float(info.get("fps", 0))
+            frames   = int(info.get("total_frames", 0))
+            duration = frames / fps if fps else 0.0
+        except Exception:
+            fps = frames = duration = 0
+
         self._paths.append(path)
-        item = QListWidgetItem(Path(path).name)
-        item.setData(Qt.UserRole, path)
+
+        meta = {
+            "label":        Path(path).name,
+            "fps":          fps,
+            "total_frames": frames,
+            "duration":     duration,
+            "loop_this":    False,
+        }
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole,     path)
+        item.setData(Qt.UserRole + 1, meta)
+        item.setData(Qt.UserRole + 2, None)   # thumbnail slot (filled async)
         item.setToolTip(path)
+        item.setSizeHint(QSize(0, _ROW_H))
         self._list.addItem(item)
 
-    def set_current(self, path: str):
+        self._start_thumb(path)
+
+    def set_current(self, path: str) -> None:
+        """Highlight *path* as the currently playing clip and scroll to it."""
+        self._current_playing = path
         for i in range(self._list.count()):
             if self._list.item(i).data(Qt.UserRole) == path:
                 self._list.setCurrentRow(i)
-                return
-        self._list.clearSelection()
+                self._list.scrollToItem(
+                    self._list.item(i), QAbstractItemView.EnsureVisible)
+                break
+        else:
+            self._list.clearSelection()
+        self._list.viewport().update()
 
     def next_path(self, current_path: str):
+        """Return the path after *current_path*, respecting loop-this-clip."""
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item and item.data(Qt.UserRole) == current_path:
+                if (item.data(Qt.UserRole + 1) or {}).get("loop_this"):
+                    return current_path   # replay same clip
+                break
+
         source = self._active_selection if self._active_selection else self._paths
         try:
             idx = source.index(current_path)
@@ -316,84 +537,169 @@ class PlaylistSidebar(QWidget):
             pass
         return None
 
-    def clear(self):
+    def clear(self) -> None:
+        self._cleanup_threads()
         self._list.clear()
         self._paths.clear()
         self._active_selection.clear()
+        self._current_playing = ""
 
-    # ── Drag-and-drop ─────────────────────────────────────────────────── #
+    # ── Drag-and-drop (OS → sidebar) ─────────────────────────────────────── #
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def dropEvent(self, event):
+    def dropEvent(self, event) -> None:
         for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if Path(path).suffix.lower() in constants.VIDEO_EXTS:
-                self.add_video(path)
+            p = url.toLocalFile()
+            if Path(p).suffix.lower() in constants.VIDEO_EXTS:
+                self.add_video(p)
 
-    # ── Private ───────────────────────────────────────────────────────── #
+    # ── Thumbnail loading ─────────────────────────────────────────────────── #
 
-    def _on_item_clicked(self, item):
+    def _start_thumb(self, path: str) -> None:
+        if path in self._thumb_threads:
+            return
+        t = _ThumbnailLoader(path, self)
+        t.done.connect(self._on_thumb_ready)
+        t.finished.connect(lambda p=path: self._thumb_threads.pop(p, None))
+        self._thumb_threads[path] = t
+        t.start()
+
+    def _on_thumb_ready(self, path: str, pix: object) -> None:
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item and item.data(Qt.UserRole) == path:
+                item.setData(Qt.UserRole + 2, pix)
+                self._list.viewport().update()
+                break
+
+    def _cleanup_threads(self) -> None:
+        for t in list(self._thumb_threads.values()):
+            t.quit()
+            t.wait(300)
+        self._thumb_threads.clear()
+
+    # ── List interaction ─────────────────────────────────────────────────── #
+
+    def _on_item_clicked(self, item) -> None:
         if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
-            return  # modifier held — just update selection, don't play
+            return   # modifier held — update selection only, don't play
         self._active_selection.clear()
         self.video_selected.emit(item.data(Qt.UserRole))
 
-    def _play_selected(self):
-        selected = self._list.selectedItems()
-        if not selected:
+    def _play_selected(self) -> None:
+        items = sorted(self._list.selectedItems(),
+                       key=lambda it: self._list.row(it))
+        if not items:
             return
-        selected.sort(key=lambda item: self._list.row(item))
-        paths = [item.data(Qt.UserRole) for item in selected]
+        paths = [it.data(Qt.UserRole) for it in items]
         self._active_selection = paths
         self.selection_play_requested.emit(paths)
 
-    def _show_context_menu(self, pos):
-        menu = QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu {{
-                background: {constants.BORDER};
-                color: {constants.TEXT_PRI};
-                border: 1px solid {constants.SPLITTER_COLOR};
-                font-size: 11px;
-            }}
-            QMenu::item {{ padding: 6px 18px; }}
-            QMenu::item:selected {{ background: {constants.ACCENT_HI}; color: white; }}
-            QMenu::separator {{ height: 1px; background: {constants.SPLITTER_COLOR}; margin: 2px 0; }}
-        """)
-        add_act = menu.addAction("Add Videos…")
-        add_act.triggered.connect(self._on_add_clicked)
-        selected = self._list.selectedItems()
-        if len(selected) >= 2:
-            play_sel_act = menu.addAction(f"Play Selected  ({len(selected)})")
-            play_sel_act.triggered.connect(self._play_selected)
-        item = self._list.itemAt(pos)
-        if item is not None:
-            menu.addSeparator()
-            remove_act = menu.addAction("Remove from Playlist")
-            remove_act.triggered.connect(lambda: self._remove_item(item))
-        menu.exec_(self._list.mapToGlobal(pos))
+    def _apply_filter(self, text: str) -> None:
+        text = text.lower().strip()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            path  = item.data(Qt.UserRole) or ""
+            label = (item.data(Qt.UserRole + 1) or {}).get("label", "").lower()
+            match = not text or text in label or text in path.lower()
+            item.setHidden(not match)
 
-    def _remove_item(self, item):
-        path = item.data(Qt.UserRole)
-        self._list.takeItem(self._list.row(item))
-        if path in self._paths:
-            self._paths.remove(path)
+    def _move_up(self) -> None:
+        row = self._list.currentRow()
+        if row <= 0:
+            return
+        item = self._list.takeItem(row)
+        self._list.insertItem(row - 1, item)
+        self._list.setCurrentRow(row - 1)
+        self._sync_paths()
 
-    def _sync_paths(self):
+    def _move_down(self) -> None:
+        row = self._list.currentRow()
+        if row < 0 or row >= self._list.count() - 1:
+            return
+        item = self._list.takeItem(row)
+        self._list.insertItem(row + 1, item)
+        self._list.setCurrentRow(row + 1)
+        self._sync_paths()
+
+    def _sync_paths(self) -> None:
         self._paths = [
             self._list.item(i).data(Qt.UserRole)
             for i in range(self._list.count())
         ]
 
-    def _on_add_clicked(self):
+    def _remove_item(self, item) -> None:
+        path = item.data(Qt.UserRole)
+        self._list.takeItem(self._list.row(item))
+        self._paths = [p for p in self._paths if p != path]
+        if path in self._active_selection:
+            self._active_selection.remove(path)
+
+    def _rename_item(self, item) -> None:
+        meta = item.data(Qt.UserRole + 1) or {}
+        cur  = meta.get("label", Path(item.data(Qt.UserRole)).name)
+        text, ok = QInputDialog.getText(self, "Rename clip", "Label:", text=cur)
+        if ok and text.strip():
+            meta["label"] = text.strip()
+            item.setData(Qt.UserRole + 1, meta)
+            self._list.viewport().update()
+
+    def _toggle_loop_item(self, item) -> None:
+        meta = item.data(Qt.UserRole + 1) or {}
+        meta["loop_this"] = not meta.get("loop_this", False)
+        item.setData(Qt.UserRole + 1, meta)
+        self._list.viewport().update()
+
+    # ── Context menu ─────────────────────────────────────────────────────── #
+
+    _MENU_STYLE = f"""
+        QMenu{{background:{constants.BORDER};color:{constants.TEXT_PRI};
+            border:1px solid {constants.SPLITTER_COLOR};font-size:11px;}}
+        QMenu::item{{padding:6px 18px;}}
+        QMenu::item:selected{{background:{constants.ACCENT_HI};color:white;}}
+        QMenu::separator{{height:1px;background:{constants.SPLITTER_COLOR};margin:2px 0;}}
+    """
+
+    def _show_context_menu(self, pos) -> None:
+        menu     = QMenu(self)
+        menu.setStyleSheet(self._MENU_STYLE)
+        item     = self._list.itemAt(pos)
+        selected = self._list.selectedItems()
+
+        add_act = menu.addAction("Add Videos…")
+        add_act.triggered.connect(self._on_add_clicked)
+
+        if len(selected) >= 2:
+            menu.addSeparator()
+            act = menu.addAction(f"Play Selected  ({len(selected)})")
+            act.triggered.connect(self._play_selected)
+
+        if item is not None:
+            menu.addSeparator()
+            meta    = item.data(Qt.UserRole + 1) or {}
+            loop_on = meta.get("loop_this", False)
+            loop_act = menu.addAction(
+                "✓  Loop this clip" if loop_on else "Loop this clip")
+            loop_act.triggered.connect(lambda: self._toggle_loop_item(item))
+
+            ren_act = menu.addAction("Rename…")
+            ren_act.triggered.connect(lambda: self._rename_item(item))
+
+            menu.addSeparator()
+            rem_act = menu.addAction("Remove")
+            rem_act.triggered.connect(lambda: self._remove_item(item))
+
+        menu.exec_(self._list.mapToGlobal(pos))
+
+    def _on_add_clicked(self) -> None:
         exts = " ".join(f"*{e}" for e in sorted(constants.VIDEO_EXTS))
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add videos to playlist", "",
+            self, "Add videos", "",
             f"Video files ({exts});;All files (*)")
         for p in paths:
             self.add_video(p)
