@@ -248,9 +248,17 @@ class _ThumbnailLoader(QThread):
 class _PlaylistDelegate(QStyledItemDelegate):
     """Renders each row: thumbnail | label + filename + duration/frame info."""
 
+    _loop_pix: QPixmap | None = None   # cached once, shared across all instances
+
     def __init__(self, sidebar: "PlaylistSidebar", parent=None) -> None:
         super().__init__(parent)
         self._sb = sidebar
+        if _PlaylistDelegate._loop_pix is None:
+            raw = QPixmap(str(constants.ICONS_DIR / "loop.png"))
+            _PlaylistDelegate._loop_pix = (
+                raw.scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                if not raw.isNull() else QPixmap()
+            )
 
     def sizeHint(self, _option, _index) -> QSize:
         return QSize(0, _ROW_H)
@@ -322,17 +330,8 @@ class _PlaylistDelegate(QStyledItemDelegate):
                          Qt.AlignLeft | Qt.AlignVCenter, elided)
 
         # Loop badge (top-right corner of text block)
-        if loop_on:
-            badge = QRect(r.right() - 22, r.y() + 8, 18, 18)
-            painter.fillRect(badge,
-                             QColor(constants.ACCENT_HI) if selected
-                             else QColor("#1b3d5a"))
-            f2 = painter.font()
-            f2.setPointSize(9)
-            f2.setBold(False)
-            painter.setFont(f2)
-            painter.setPen(QColor("white"))
-            painter.drawText(badge, Qt.AlignCenter, "↺")
+        if loop_on and self._loop_pix and not self._loop_pix.isNull():
+            painter.drawPixmap(r.right() - 22, r.y() + 8, self._loop_pix)
 
         # Row 2 — filename in grey (only shown when the label was renamed)
         f.setBold(False)
@@ -402,8 +401,8 @@ class PlaylistSidebar(QWidget):
         hl.addWidget(title)
         hl.addStretch()
 
-        self._up_btn   = self._mk_hdr_btn("▲", "Move up")
-        self._down_btn = self._mk_hdr_btn("▼", "Move down")
+        self._up_btn   = self._mk_hdr_btn("caret-arrow-up.png", "Move up")
+        self._down_btn = self._mk_hdr_btn("down.png", "Move down")
         self._up_btn.clicked.connect(self._move_up)
         self._down_btn.clicked.connect(self._move_down)
         hl.addWidget(self._up_btn)
@@ -459,16 +458,16 @@ class PlaylistSidebar(QWidget):
         self._list.itemClicked.connect(self._on_item_clicked)
         root.addWidget(self._list, stretch=1)
 
-    def _mk_hdr_btn(self, text: str, tip: str) -> QPushButton:
-        btn = QPushButton(text)
+    def _mk_hdr_btn(self, icon_name: str, tip: str) -> QPushButton:
+        btn = QPushButton()
+        btn.setIcon(_icon(icon_name))
+        btn.setIconSize(QSize(14, 14))
         btn.setFixedSize(22, 22)
         btn.setFocusPolicy(Qt.NoFocus)
         btn.setToolTip(tip)
         btn.setStyleSheet(f"""
-            QPushButton{{background:transparent;color:{constants.TEXT_SEC};
-                border:none;font-size:11px;}}
-            QPushButton:hover{{color:white;background:{constants.ACCENT};
-                border-radius:3px;}}
+            QPushButton{{background:transparent;border:none;}}
+            QPushButton:hover{{background:{constants.ACCENT};border-radius:3px;}}
         """)
         return btn
 
@@ -683,8 +682,9 @@ class PlaylistSidebar(QWidget):
             menu.addSeparator()
             meta    = item.data(Qt.UserRole + 1) or {}
             loop_on = meta.get("loop_this", False)
-            loop_act = menu.addAction(
-                "✓  Loop this clip" if loop_on else "Loop this clip")
+            loop_act = menu.addAction("Loop this clip")
+            if loop_on:
+                loop_act.setIcon(_icon("check.png"))
             loop_act.triggered.connect(lambda: self._toggle_loop_item(item))
 
             ren_act = menu.addAction("Rename…")
