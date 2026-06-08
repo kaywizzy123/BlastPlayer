@@ -1357,6 +1357,15 @@ void main() {
         else:
             super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # Bubble up — PlayerWidget catches this via its own override
+            parent = self.parent()
+            if parent:
+                parent.mouseDoubleClickEvent(event)
+        else:
+            super().mouseDoubleClickEvent(event)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Player widget
@@ -2351,6 +2360,7 @@ class PlayerWidget(QWidget):
 
         # ── Timeline strip ────────────────────────────────────────────────
         timeline = QWidget()
+        self._timeline_widget = timeline
         timeline.setFixedHeight(64)
         timeline.setStyleSheet("background: black;")
         tl = QVBoxLayout(timeline)
@@ -2403,6 +2413,7 @@ class PlayerWidget(QWidget):
 
         # ── Transport row ─────────────────────────────────────────────────
         transport = QWidget()
+        self._transport_widget = transport
         transport.setFixedHeight(40)
         transport.setStyleSheet(f"background: {constants.BORDER};")
         tr = QHBoxLayout(transport)
@@ -2911,6 +2922,17 @@ class PlayerWidget(QWidget):
         super().resizeEvent(event)
         self._refresh_display()
 
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.fullscreen_requested.emit()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Notify the window so it can reset the auto-hide timer in fullscreen.
+        self.window().event(event)
+        super().mouseMoveEvent(event)
+
     # ------------------------------------------------------------------ #
     #  Scrubber slots                                                      #
     # ------------------------------------------------------------------ #
@@ -3257,7 +3279,14 @@ class PlayerWidget(QWidget):
     #  Zoom / pan                                                          #
     # ------------------------------------------------------------------ #
 
+    fullscreen_requested = pyqtSignal()   # emitted on double-click of the canvas
+
     _ZOOM_STEP = 1.25
+
+    def toggle_chrome(self, visible: bool):
+        """Show or hide the timeline and transport bar (used in fullscreen)."""
+        self._timeline_widget.setVisible(visible)
+        self._transport_widget.setVisible(visible)
 
     def zoom_in(self):
         self._zoom = min(self._zoom * self._ZOOM_STEP, 16.0)
@@ -3468,9 +3497,11 @@ class BlastPlayerWindow(QMainWindow):
         self._stack.addWidget(self._player)
         self.setCentralWidget(self._stack)
 
+        self._fs_dock_was_visible = False
         self._build_menu()
         self._setup_shortcuts()
         self._build_playlist_dock()
+        self._build_fullscreen_timer()
         self._restore_geometry()
         self._restore_settings()
         self._player.video_ended.connect(self._on_video_ended)
@@ -3802,14 +3833,65 @@ class BlastPlayerWindow(QMainWindow):
         s.setValue("loopOnScrub",    self._player._loop_on_scrub)
         s.setValue("speedIndex",     self._player._speed_combo.currentIndex())
 
+    # ------------------------------------------------------------------ #
+    #  Fullscreen                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _build_fullscreen_timer(self):
+        self._fs_hide_timer = QTimer(self)
+        self._fs_hide_timer.setSingleShot(True)
+        self._fs_hide_timer.setInterval(2500)
+        self._fs_hide_timer.timeout.connect(self._fs_hide_chrome)
+        self._player.fullscreen_requested.connect(self._toggle_fullscreen)
+
     def _toggle_fullscreen(self):
-        self.showNormal() if self.isFullScreen() else self.showFullScreen()
+        if self.isFullScreen():
+            self._exit_fullscreen()
+        else:
+            self._enter_fullscreen()
+
+    def _enter_fullscreen(self):
+        self._fs_dock_was_visible = self._playlist_dock.isVisible()
+        if self._fs_dock_was_visible:
+            self._playlist_dock.hide()
+        self.menuBar().hide()
+        self.showFullScreen()
+        self.setMouseTracking(True)
+        self._player.setMouseTracking(True)
+        self._player._canvas.setMouseTracking(True)
+        self._fs_hide_timer.start()
+
+    def _exit_fullscreen(self):
+        self._fs_hide_timer.stop()
+        self._fs_show_chrome()
+        self.menuBar().show()
+        self.showNormal()
+        self.setMouseTracking(False)
+        self._player.setMouseTracking(False)
+        self._player._canvas.setMouseTracking(False)
+        if self._fs_dock_was_visible:
+            self._playlist_dock.show()
+
+    def _fs_show_chrome(self):
+        self._player.toggle_chrome(True)
+        self.unsetCursor()
+
+    def _fs_hide_chrome(self):
+        if self.isFullScreen():
+            self._player.toggle_chrome(False)
+            self.setCursor(Qt.BlankCursor)
+
+    def mouseMoveEvent(self, event):
+        if self.isFullScreen():
+            self._fs_show_chrome()
+            self._fs_hide_timer.start()
+        super().mouseMoveEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_F11:
             self._toggle_fullscreen()
         elif event.key() == Qt.Key_Escape and self.isFullScreen():
-            self.showNormal()
+            self._exit_fullscreen()
         else:
             super().keyPressEvent(event)
 
