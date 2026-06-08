@@ -2903,9 +2903,9 @@ class PlayerWidget(QWidget):
         if not self._path:
             return
         if self._mc_idx >= 0 and self._mc_clips:
-            # Resolve global position to local frame in the active clip only
             local_frame, clip_idx = self._global_to_local(value)
             if clip_idx == self._mc_idx:
+                # Same clip — use frame cache or fetch normally
                 if self._frame_cache and local_frame < len(self._frame_cache):
                     self._render_raw(self._frame_cache[local_frame])
                 else:
@@ -2913,6 +2913,31 @@ class PlayerWidget(QWidget):
                     if raw:
                         self._render_raw(raw)
                 self._current_frame = local_frame
+            else:
+                # Cross-clip scrub — temporarily adopt the target clip's metadata
+                # so _fetch_frame builds the right ffmpeg command and _canvas gets
+                # the right dimensions. GPU cache is bypassed (it belongs to the
+                # current clip).
+                tc  = self._mc_clips[clip_idx]
+                saved = (self._path, self._fps,
+                         self._vid_w, self._vid_h,
+                         self._is_hdr, self._pix_fmt, self._bytes_per_pixel)
+                tc_hdr = self._detect_hdr(tc['path'])
+                self._path, self._fps     = tc['path'], tc['fps']
+                self._vid_w, self._vid_h  = tc['width'], tc['height']
+                self._is_hdr              = tc_hdr
+                self._pix_fmt             = "rgb48le" if tc_hdr else "rgb24"
+                self._bytes_per_pixel     = 6 if tc_hdr else 3
+                raw = self._fetch_frame(local_frame)
+                # Capture dims before restore (needed for set_frame call)
+                tc_w, tc_h = self._effective_size()
+                tc_is_hdr  = self._is_hdr
+                (self._path, self._fps,
+                 self._vid_w, self._vid_h,
+                 self._is_hdr, self._pix_fmt, self._bytes_per_pixel) = saved
+                if raw:
+                    # Call set_frame directly — bypasses the current-clip GPU cache
+                    self._canvas.set_frame(raw, tc_w, tc_h, is_hdr=tc_is_hdr)
             self._update_info()
             self._audio.scrub(value, mc_clips=self._mc_clips)
             return
