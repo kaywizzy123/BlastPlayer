@@ -1806,19 +1806,20 @@ class PlayerWidget(QWidget):
             self._mc_next_queue  = None
             self._mc_next_thread = None
             self._mc_next_stop   = threading.Event()
-            # Paint frame 0 immediately — closes the visual gap at the cut point.
-            # Set play_frame_start=1 so the next tick targets frame 1, not frame 0.
-            # Without this, floor(elapsed * fps) ≈ 0.98 truncates to 0, pipe_frame=1
-            # wins the comparison and nothing renders for a full extra interval.
-            try:
-                first_raw = self._frame_queue.get_nowait()
-                if first_raw is not None:
-                    self._render_raw(first_raw)
-                    self._pipe_frame       = 1
-                    self._play_frame_start = 1   # frame 0 already consumed
-                    self._play_clock_start = time.monotonic()
-            except queue.Empty:
-                pass  # pre-warm not ready; normal tick loop catches frame 0
+            # Paint frame 0 immediately — closes the visual gap at the cut point,
+            # but ONLY when there is no CPU cache.  If a cache is available the
+            # timer serves the correct first frame on the very next tick; rendering
+            # from the pipe here would flash an out-of-context frame 0.
+            if self._frame_cache is None:
+                try:
+                    first_raw = self._frame_queue.get_nowait()
+                    if first_raw is not None:
+                        self._render_raw(first_raw)
+                        self._pipe_frame       = 1
+                        self._play_frame_start = 1   # frame 0 already consumed
+                        self._play_clock_start = time.monotonic()
+                except queue.Empty:
+                    pass  # pre-warm not ready; normal tick loop catches frame 0
         else:
             self._open_pipe(0)
 
