@@ -268,9 +268,26 @@ class AudioEngine(QObject):
         self._play_pos = min(self._frame_to_sample(frame) + 1, len(self._pcm))
         self._mode = self._PLAYING_REVERSE
 
-    def scrub(self, frame: int) -> None:
+    def seek_to_clip(self, clip_idx: int) -> None:
+        """
+        In multi-clip mode, hard-seek audio to the start of *clip_idx* and
+        resume PLAYING.  Call this every time the mc timeline advances to a
+        new clip so the audio clock stays locked to the video clock.
+        """
+        if self._pcm is None:
+            return
+        if 0 <= clip_idx < len(self._sample_offsets):
+            self._play_pos = self._sample_offsets[clip_idx]
+        else:
+            self._play_pos = 0
+        self._mode = self._PLAYING
+
+    def scrub(self, frame: int, mc_clips: list | None = None) -> None:
         """
         Play a short audio snippet at *frame* for scrub drag feedback.
+
+        Pass *mc_clips* when scrubbing a multi-clip timeline so the global
+        frame is mapped to the correct sample via the clip offset table.
 
         Rate-limited: successive calls closer than SCRUB_MIN_GAP apart
         are ignored so the callback is never starved.
@@ -282,7 +299,8 @@ class AudioEngine(QObject):
             return
         self._last_scrub_t = now
 
-        pos = self._frame_to_sample(frame)
+        pos = (self.global_frame_to_sample(frame, mc_clips)
+               if mc_clips else self._frame_to_sample(frame))
         self._scrub_pos = pos
         self._scrub_end = min(pos + self.SCRUB_SAMPLES, len(self._pcm))
         self._mode = self._SCRUBBING
