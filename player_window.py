@@ -803,6 +803,7 @@ class ScrubberSlider(QSlider):
         self._groove_pressed = False
         self._in_frame  = None   # int | None
         self._out_frame = None   # int | None
+        self._mc_clips  = []     # list of clip dicts for multi-clip band painting
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -860,9 +861,13 @@ class ScrubberSlider(QSlider):
         self._out_frame = out_frame
         self.update()
 
+    def set_mc_clips(self, clips: list):
+        self._mc_clips = clips
+        self.update()
+
     def paintEvent(self, event):
         super().paintEvent(event)
-        if self._in_frame is None and self._out_frame is None:
+        if self._in_frame is None and self._out_frame is None and not self._mc_clips:
             return
 
         opt    = QStyleOptionSlider()
@@ -872,6 +877,7 @@ class ScrubberSlider(QSlider):
         span   = groove.width() - handle.width()
         offset = groove.x() + handle.width() // 2
         gy     = groove.center().y()
+        gh     = groove.height()
 
         def x_for(val):
             return offset + QStyle.sliderPositionFromValue(
@@ -880,11 +886,29 @@ class ScrubberSlider(QSlider):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, False)
 
+        # Multi-clip bands: alternate a light tint on odd-indexed clips
+        if len(self._mc_clips) > 1:
+            total = self.maximum() + 1
+            band_color = QColor(255, 255, 255, 30)
+            div_color  = QColor(255, 255, 255, 80)
+            for i, clip in enumerate(self._mc_clips):
+                x_start = x_for(clip['offset'])
+                end_frame = clip['offset'] + clip['total_frames'] - 1
+                x_end = x_for(min(end_frame, self.maximum()))
+                if i % 2 == 1 and x_end > x_start:
+                    painter.fillRect(x_start, gy - gh // 2,
+                                     x_end - x_start, gh, band_color)
+                # Divider at each clip boundary except the first
+                if i > 0:
+                    painter.setPen(QPen(div_color, 1))
+                    painter.drawLine(x_start, gy - gh, x_start, gy + gh)
+
         # Tinted range between in and out
         x_in  = x_for(self._in_frame  if self._in_frame  is not None else self.minimum())
         x_out = x_for(self._out_frame if self._out_frame is not None else self.maximum())
-        if x_out > x_in:
-            painter.fillRect(x_in, gy - 3, x_out - x_in, 6, QColor(255, 170, 0, 90))
+        if self._in_frame is not None or self._out_frame is not None:
+            if x_out > x_in:
+                painter.fillRect(x_in, gy - 3, x_out - x_in, 6, QColor(255, 170, 0, 90))
 
         # In-point marker (green)
         if self._in_frame is not None:
@@ -1631,6 +1655,7 @@ class PlayerWidget(QWidget):
         self._scrubber.setRange(0, max(total - 1, 0))
         self._scrubber.setValue(0)
         self._scrubber.blockSignals(False)
+        self._scrubber.set_mc_clips(clips)
         self._frames_lbl.setText(f"{total} frames")
         # Reload audio engine with the full multi-clip sequence
         self.audio_loading.emit(True)
@@ -3265,6 +3290,7 @@ class PlayerWidget(QWidget):
         self._in_frame  = None
         self._out_frame = None
         self._scrubber.set_in_out(None, None)
+        self._scrubber.set_mc_clips([])
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._canvas.clear_gpu_cache()
