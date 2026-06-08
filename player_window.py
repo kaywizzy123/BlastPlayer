@@ -2687,9 +2687,12 @@ class PlayerWidget(QWidget):
                 out  = min(self._effective_out(), len(self._frame_cache) - 1)
                 in_f = self._effective_in()
                 if target_frame > out:
+                    # True when the out-point is in or before the current clip —
+                    # including the edge case where it falls on the very last frame.
+                    # (The old "out < len-1" test missed that last-frame case.)
                     cache_out_reached = (
                         self._out_frame is not None
-                        and out < len(self._frame_cache) - 1
+                        and self._out_frame < self._mc_offset() + self._total_frames
                     )
                     if self._loop and self._mc_idx < 0:
                         # Single-clip loop
