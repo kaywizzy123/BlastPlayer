@@ -528,16 +528,15 @@ class PlaylistSidebar(QWidget):
         self._start_thumb(path)
 
     def set_current(self, path: str) -> None:
-        """Highlight *path* as the currently playing clip and scroll to it."""
+        """Mark *path* as the currently playing clip and scroll to it.
+        Only updates the playing indicator drawn by the delegate — Qt selection
+        is left untouched so multi-clip selections don't get clobbered."""
         self._current_playing = path
         for i in range(self._list.count()):
             if self._list.item(i).data(Qt.UserRole) == path:
-                self._list.setCurrentRow(i)
                 self._list.scrollToItem(
                     self._list.item(i), QAbstractItemView.EnsureVisible)
                 break
-        else:
-            self._list.clearSelection()
         self._list.viewport().update()
 
     def next_path(self, current_path: str):
@@ -632,6 +631,9 @@ class PlaylistSidebar(QWidget):
             for it in items
         ]
         self._active_selection = [c["path"] for c in clip_infos]
+        # Clear the Qt selection — the playing indicator in the delegate
+        # will track whichever clip is active without all items staying highlighted.
+        self._list.clearSelection()
         self.selection_play_requested.emit(clip_infos)
 
     def _apply_filter(self, text: str) -> None:
@@ -1395,8 +1397,9 @@ class PlayerWidget(QWidget):
     _CACHE_MAX_MB       = 2048   # skip CPU RAM cache if decoded frames exceed this
     _PREFETCH_QUEUE_SIZE = 16    # frames buffered ahead in the pipe reader thread
 
-    video_ended   = pyqtSignal()        # emitted when video reaches end without looping
-    audio_loading = pyqtSignal(bool)   # True = PCM decode started, False = finished
+    video_ended          = pyqtSignal()
+    audio_loading        = pyqtSignal(bool)
+    active_clip_changed  = pyqtSignal(str)  # path of newly active clip in mc timeline
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2981,6 +2984,7 @@ class PlayerWidget(QWidget):
                 self._reverse_cache   = []
                 self._loop_frame0     = None
                 self._mc_idx          = target_idx
+                self.active_clip_changed.emit(self._path)
 
                 total = sum(c['total_frames'] for c in self._mc_clips)
                 self._scrubber.blockSignals(True)
@@ -3188,6 +3192,7 @@ class PlayerWidget(QWidget):
                     self._scrubber.setRange(0, max(total - 1, 0))
                     self._scrubber.setValue(self._mc_offset() + self._current_frame)
                     self._scrubber.blockSignals(False)
+                    self.active_clip_changed.emit(self._path)
                     self._update_info()
                 else:
                     self._audio.stop()
@@ -3217,6 +3222,7 @@ class PlayerWidget(QWidget):
             self._advance_to_clip(next_clip)
             self._mc_clips = clips_backup
             self._mc_idx   = next_idx
+            self.active_clip_changed.emit(self._path)
             # Re-anchor audio to the start of the new clip every transition.
             # Without this the PortAudio callback drains the buffer and stops.
             self._audio.seek_to_clip(next_idx)
@@ -3558,6 +3564,7 @@ class BlastPlayerWindow(QMainWindow):
         self._playlist.video_selected.connect(self._on_playlist_video_selected)
         self._playlist.selection_play_requested.connect(
             self._player.load_multi_clips)
+        self._player.active_clip_changed.connect(self._playlist.set_current)
 
     def _on_playlist_video_selected(self, path: str):
         self.open_video(path)
