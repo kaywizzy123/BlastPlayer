@@ -3174,6 +3174,11 @@ class PlayerWidget(QWidget):
                         self._pipe_frame = self._current_frame
                     self._play_frame_start = self._current_frame
                     self._play_clock_start = time.monotonic()
+                    # Pre-warm the next clip so transitions inside the in/out
+                    # range are seamless (same as normal non-in/out playback).
+                    prewarm_idx = self._mc_idx + 1
+                    if prewarm_idx < len(self._mc_clips):
+                        self._open_mc_next_pipe(self._mc_clips[prewarm_idx])
                     total = sum(c['total_frames'] for c in self._mc_clips)
                     self._scrubber.blockSignals(True)
                     self._scrubber.setRange(0, max(total - 1, 0))
