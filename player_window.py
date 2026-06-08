@@ -44,7 +44,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QSlider, QSizePolicy,
     QAction, QFileDialog, QMessageBox,
     QFrame, QToolButton, QActionGroup, QComboBox, QShortcut,
-    QOpenGLWidget, QListWidget, QListWidgetItem, QMenu, QSplitter,
+    QOpenGLWidget, QListWidget, QListWidgetItem, QMenu, QDockWidget,
     QApplication, QLineEdit, QInputDialog, QProgressBar,
     QStyledItemDelegate, QAbstractItemView, QStyle,
 )
@@ -2342,30 +2342,12 @@ class PlayerWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Content row: playlist sidebar + video canvas ──────────────────
-        self._content_splitter = QSplitter(Qt.Horizontal)
-        self._content_splitter.setHandleWidth(2)
-        self._content_splitter.setStyleSheet("""
-            QSplitter::handle:horizontal { background: #2a2a2a; }
-            QSplitter::handle:horizontal:hover { background: #444; }
-        """)
-
-        self._playlist_sidebar = PlaylistSidebar()
-        self._playlist_sidebar.setVisible(False)
-        self._playlist_sidebar.video_selected.connect(self._on_playlist_select)
-        self._playlist_sidebar.selection_play_requested.connect(self.load_multi_clips)
-        self._content_splitter.addWidget(self._playlist_sidebar)
-
+        # ── Content row: video canvas ─────────────────────────────────────
         self._canvas = VideoCanvas()
         self._canvas.zoom_scrolled.connect(self._on_zoom_scroll)
         self._canvas.pan_dragged.connect(self._on_pan_drag)
-        self._content_splitter.addWidget(self._canvas)
 
-        self._content_splitter.setSizes([240, 10000])
-        self._content_splitter.setCollapsible(0, False)
-        self._content_splitter.setCollapsible(1, False)
-
-        root.addWidget(self._content_splitter, stretch=1)
+        root.addWidget(self._canvas, stretch=1)
 
         # ── Timeline strip ────────────────────────────────────────────────
         timeline = QWidget()
@@ -3149,14 +3131,13 @@ class PlayerWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def _toggle_playlist(self, checked: bool):
-        self._playlist_sidebar.setVisible(checked)
+        # Dock visibility is managed by BlastPlayerWindow; just sync the style.
         self._playlist_btn.setStyleSheet(self._loop_style(checked))
 
     def _on_playlist_select(self, path: str):
         from pathlib import Path as _P
         if _P(path).is_file():
             self.load_video(path)
-            self._playlist_sidebar.set_current(path)
             QTimer.singleShot(0, self._refresh_display)
 
     def _end_of_video(self, out_reached: bool = False):
@@ -3489,11 +3470,66 @@ class BlastPlayerWindow(QMainWindow):
 
         self._build_menu()
         self._setup_shortcuts()
+        self._build_playlist_dock()
         self._restore_geometry()
         self._restore_settings()
         self._player.video_ended.connect(self._on_video_ended)
-        self._player.audio_loading.connect(
-            self._player._playlist_sidebar.set_audio_loading)
+        self._player.audio_loading.connect(self._playlist.set_audio_loading)
+
+    # ------------------------------------------------------------------ #
+    #  Playlist dock                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _build_playlist_dock(self):
+        self._playlist = PlaylistSidebar()
+
+        self._playlist_dock = QDockWidget("Playlist", self)
+        self._playlist_dock.setObjectName("PlaylistDock")
+        self._playlist_dock.setWidget(self._playlist)
+        self._playlist_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self._playlist_dock.setFeatures(
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable)
+        self._playlist_dock.setStyleSheet(f"""
+            QDockWidget {{
+                border: 1px solid {constants.SPLITTER_COLOR};
+                titlebar-close-icon: url(none);
+            }}
+            QDockWidget::title {{
+                background: {constants.ACCENT};
+                color: {constants.TEXT_PRI};
+                padding: 5px 8px;
+                font-size: 11px;
+                font-weight: bold;
+            }}
+            QDockWidget::close-button, QDockWidget::float-button {{
+                border: none;
+                background: transparent;
+                padding: 2px;
+                subcontrol-position: top right;
+            }}
+            QDockWidget::close-button:hover, QDockWidget::float-button:hover {{
+                background: {constants.SPLITTER_COLOR};
+                border-radius: 3px;
+            }}
+        """)
+        self._playlist_dock.setVisible(False)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self._playlist_dock)
+
+        # Sync toggle button ↔ dock visibility
+        self._player._playlist_btn.toggled.connect(self._playlist_dock.setVisible)
+        self._playlist_dock.visibilityChanged.connect(
+            self._player._playlist_btn.setChecked)
+
+        # Playlist signals
+        self._playlist.video_selected.connect(self._on_playlist_video_selected)
+        self._playlist.selection_play_requested.connect(
+            self._player.load_multi_clips)
+
+    def _on_playlist_video_selected(self, path: str):
+        self.open_video(path)
 
     # ------------------------------------------------------------------ #
     #  Title                                                               #
@@ -3678,8 +3714,8 @@ class BlastPlayerWindow(QMainWindow):
         self._stack.setCurrentIndex(1)
         self._player.setFocus()
         self._update_title(0)
-        self._player._playlist_sidebar.add_video(path)
-        self._player._playlist_sidebar.set_current(path)
+        self._playlist.add_video(path)
+        self._playlist.set_current(path)
         QTimer.singleShot(0, self._player._refresh_display)
 
     def open_playlist(self, paths: list):
@@ -3689,13 +3725,12 @@ class BlastPlayerWindow(QMainWindow):
             return
         self.open_video(valid[0])
         for path in valid[1:]:
-            self._player._playlist_sidebar.add_video(path)
-        # Show the playlist sidebar so the user can see the queue
-        self._player._playlist_sidebar.setVisible(True)
-        self._player._playlist_btn.setChecked(True)
+            self._playlist.add_video(path)
+        # Show the playlist dock so the user can see the queue
+        self._playlist_dock.setVisible(True)
 
     def _on_video_ended(self):
-        next_path = self._player._playlist_sidebar.next_path(self._player._path)
+        next_path = self._playlist.next_path(self._player._path)
         if next_path:
             self.open_video(next_path)
 
@@ -3709,10 +3744,14 @@ class BlastPlayerWindow(QMainWindow):
             self.restoreGeometry(geom)
         else:
             self.resize(1280, 720)
+        state = s.value("windowState")
+        if state:
+            self.restoreState(state)
 
     def _save_geometry(self):
         s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
         s.setValue("windowGeometry", self.saveGeometry())
+        s.setValue("windowState",    self.saveState())
 
     def _restore_settings(self):
         s = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
@@ -3892,7 +3931,7 @@ class BlastPlayerWindow(QMainWindow):
             return
         self.open_video(paths[0])          # play the first one immediately
         for path in paths[1:]:             # queue the rest
-            self._player._playlist_sidebar.add_video(path)
+            self._playlist.add_video(path)
 
     def closeEvent(self, event):
         self._save_geometry()
