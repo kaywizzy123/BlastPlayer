@@ -3007,6 +3007,10 @@ class PlayerWidget(QWidget):
                     if raw:
                         self._canvas.set_frame(raw, tc_w, tc_h, is_hdr=tc_hdr)
             self._update_info()
+            # _update_info uses _mc_idx/_current_frame (active clip); for a
+            # cross-clip scrub those haven't changed, so patch the counter directly.
+            if clip_idx != self._mc_idx:
+                self._frame_num_lbl.setText(str(value + 1))
             self._audio.scrub(value, mc_clips=self._mc_clips)
             return
         # Single-clip mode
