@@ -1410,6 +1410,8 @@ class PlayerWidget(QWidget):
         # RAM frame cache — all frames decoded into memory for zero-latency playback
         self._frame_cache   = None   # list[bytes] once ready, None while not cached
         self._cache_loading = False  # True while background decode is running
+        # Per-clip cache for multi-clip mode (keyed by path)
+        self._mc_caches: dict = {}   # path → list[bytes]
 
         # GPU texture cache — frames uploaded to VideoCanvas texture pool
         self._gpu_cache_ready   = False
@@ -1633,6 +1635,10 @@ class PlayerWidget(QWidget):
         # Reload audio engine with the full multi-clip sequence
         self.audio_loading.emit(True)
         self._audio.load(clips[0]['path'], clips[0]['fps'], mc_clips=clips)
+        # Build frame caches for all clips except clip 0 (clip 0 is handled by
+        # _start_cache_build which load_video already triggered above)
+        if len(clips) > 1:
+            self._start_mc_cache_builds(clips[1:])
         # Pre-warm clip 1's video pipe while clip 0 plays
         if len(clips) > 1:
             self._open_mc_next_pipe(clips[1])
@@ -1719,7 +1725,7 @@ class PlayerWidget(QWidget):
         self._reverse_cache    = []
         self._cache_building   = False
         self._loop_frame0      = None
-        self._frame_cache      = None
+        self._frame_cache      = self._mc_caches.get(clip['path'])  # instant if cached
         self._cache_loading    = False
         self._gpu_cache_ready  = False
         self._gpu_upload_idx   = 0
@@ -1768,7 +1774,8 @@ class PlayerWidget(QWidget):
         else:
             self._open_pipe(0)
 
-        self._start_cache_build()
+        if self._frame_cache is None:    # not yet in _mc_caches — start building
+            self._start_cache_build()
         self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
 
     # ------------------------------------------------------------------ #
@@ -1950,10 +1957,61 @@ class PlayerWidget(QWidget):
 
             if frames:
                 self._frame_cache = frames
+                self._mc_caches[path] = frames   # available for cross-clip scrubs
             self._cache_loading = False
             QTimer.singleShot(0, self._start_gpu_cache_build)
 
         threading.Thread(target=_fill, daemon=True).start()
+
+    def _start_mc_cache_builds(self, clips: list) -> None:
+        """Pre-build frame caches for all mc clips (except the active one).
+
+        Each clip gets its own background thread. Results land in
+        _mc_caches[path] so cross-clip scrubbing is served from memory.
+        """
+        vf = self._build_vf()
+        for clip in clips:
+            path = clip['path']
+            if path in self._mc_caches:
+                continue
+            is_hdr     = self._detect_hdr(path)
+            pix_fmt    = "rgb48le" if is_hdr else "rgb24"
+            bpp        = 6 if is_hdr else 3
+            rot        = self._rotation
+            fw = clip['height'] if rot in (90, 270) else clip['width']
+            fh = clip['width']  if rot in (90, 270) else clip['height']
+            frame_size = fw * fh * bpp
+            total_mb   = (clip['total_frames'] * frame_size) / 1_048_576
+            if total_mb > self._CACHE_MAX_MB:
+                continue  # too large — skip, fall back to _fetch_frame
+            src = self._exr_seq_pattern(path) if is_hdr else path
+            nf  = clip['total_frames']
+
+            def _fill(p=path, s=src, pf=pix_fmt, nb=frame_size, n=nf, v=vf):
+                cmd = [_ffmpeg_exe(), "-i", s,
+                       "-f", "rawvideo", "-pix_fmt", pf,
+                       "-vf", v, "pipe:1"]
+                frames = []
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    for _ in range(n):
+                        chunk = proc.stdout.read(nb)
+                        if len(chunk) < nb:
+                            break
+                        frames.append(bytes(chunk))
+                    try:
+                        proc.stdout.close()
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    print(f"[BlastPlayer] mc cache ({p}): {exc}")
+                if frames:
+                    self._mc_caches[p] = frames
+
+            threading.Thread(target=_fill, daemon=True).start()
 
     def _open_loop_pipe(self):
         """Pre-warm a pipe from frame 0 so the loop swap is instantaneous."""
@@ -2810,7 +2868,8 @@ class PlayerWidget(QWidget):
                 self._is_hdr          = self._detect_hdr(next_clip['path'])
                 self._pix_fmt         = "rgb48le" if self._is_hdr else "rgb24"
                 self._bytes_per_pixel = 6 if self._is_hdr else 3
-                self._frame_cache     = None
+                # Adopt pre-built cache if available; otherwise start a build
+                self._frame_cache     = self._mc_caches.get(next_clip['path'])
                 self._cache_loading   = False
                 self._gpu_cache_ready = False
                 self._gpu_upload_idx  = 0
@@ -2831,7 +2890,8 @@ class PlayerWidget(QWidget):
                     self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
                     self._play_btn.setText("")
 
-                self._start_cache_build()
+                if self._frame_cache is None:
+                    self._start_cache_build()
 
             # Seek to the local frame within the (now-active) clip
             self._current_frame = local_frame
@@ -2914,30 +2974,38 @@ class PlayerWidget(QWidget):
                         self._render_raw(raw)
                 self._current_frame = local_frame
             else:
-                # Cross-clip scrub — temporarily adopt the target clip's metadata
-                # so _fetch_frame builds the right ffmpeg command and _canvas gets
-                # the right dimensions. GPU cache is bypassed (it belongs to the
-                # current clip).
-                tc  = self._mc_clips[clip_idx]
-                saved = (self._path, self._fps,
-                         self._vid_w, self._vid_h,
-                         self._is_hdr, self._pix_fmt, self._bytes_per_pixel)
-                tc_hdr = self._detect_hdr(tc['path'])
-                self._path, self._fps     = tc['path'], tc['fps']
-                self._vid_w, self._vid_h  = tc['width'], tc['height']
-                self._is_hdr              = tc_hdr
-                self._pix_fmt             = "rgb48le" if tc_hdr else "rgb24"
-                self._bytes_per_pixel     = 6 if tc_hdr else 3
-                raw = self._fetch_frame(local_frame)
-                # Capture dims before restore (needed for set_frame call)
-                tc_w, tc_h = self._effective_size()
-                tc_is_hdr  = self._is_hdr
-                (self._path, self._fps,
-                 self._vid_w, self._vid_h,
-                 self._is_hdr, self._pix_fmt, self._bytes_per_pixel) = saved
-                if raw:
-                    # Call set_frame directly — bypasses the current-clip GPU cache
-                    self._canvas.set_frame(raw, tc_w, tc_h, is_hdr=tc_is_hdr)
+                # Cross-clip scrub — serve from pre-built cache when available
+                # (instant); otherwise temporarily adopt the target clip's metadata
+                # and fetch via ffmpeg (slow path until the background cache lands).
+                tc      = self._mc_clips[clip_idx]
+                tc_path = tc['path']
+                tc_cache = self._mc_caches.get(tc_path)
+                if tc_cache and local_frame < len(tc_cache):
+                    # Fast path: cache ready — render directly, bypassing GPU cache
+                    tc_hdr = self._detect_hdr(tc_path)
+                    rot    = self._rotation
+                    tc_w   = tc['height'] if rot in (90, 270) else tc['width']
+                    tc_h   = tc['width']  if rot in (90, 270) else tc['height']
+                    self._canvas.set_frame(tc_cache[local_frame],
+                                           tc_w, tc_h, is_hdr=tc_hdr)
+                else:
+                    # Slow path: ffmpeg single-frame fetch (cache still building)
+                    tc_hdr = self._detect_hdr(tc_path)
+                    saved  = (self._path, self._fps,
+                              self._vid_w, self._vid_h,
+                              self._is_hdr, self._pix_fmt, self._bytes_per_pixel)
+                    self._path, self._fps    = tc_path, tc['fps']
+                    self._vid_w, self._vid_h = tc['width'], tc['height']
+                    self._is_hdr             = tc_hdr
+                    self._pix_fmt            = "rgb48le" if tc_hdr else "rgb24"
+                    self._bytes_per_pixel    = 6 if tc_hdr else 3
+                    raw = self._fetch_frame(local_frame)
+                    tc_w, tc_h = self._effective_size()
+                    (self._path, self._fps,
+                     self._vid_w, self._vid_h,
+                     self._is_hdr, self._pix_fmt, self._bytes_per_pixel) = saved
+                    if raw:
+                        self._canvas.set_frame(raw, tc_w, tc_h, is_hdr=tc_hdr)
             self._update_info()
             self._audio.scrub(value, mc_clips=self._mc_clips)
             return
