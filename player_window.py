@@ -1563,17 +1563,31 @@ class PlayerWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def _effective_in(self) -> int:
-        return self._in_frame if self._in_frame is not None else 0
+        """Local frame at the in-point for the currently active clip."""
+        if self._in_frame is None:
+            return 0
+        if self._mc_idx >= 0 and self._mc_clips:
+            return max(0, self._in_frame - self._mc_offset())
+        return self._in_frame
 
     def _effective_out(self) -> int:
-        return self._out_frame if self._out_frame is not None else max(0, self._total_frames - 1)
+        """Local frame at the out-point for the currently active clip."""
+        if self._out_frame is None:
+            return max(0, self._total_frames - 1)
+        if self._mc_idx >= 0 and self._mc_clips:
+            local = self._out_frame - self._mc_offset()
+            if local < 0:
+                return 0                          # out-point is before this clip
+            if local >= self._total_frames:
+                return max(0, self._total_frames - 1)   # out-point is after this clip
+            return local
+        return self._out_frame
 
     def set_in_frame(self):
         if not self._path:
             return
-        f = self._current_frame
+        f = self._mc_offset() + self._current_frame   # always global
         if self._in_frame is not None and f == self._in_frame:
-            # Toggle off: clear in point
             self._in_frame = None
         elif self._out_frame is not None and f >= self._out_frame:
             return  # invalid: in must be before out
@@ -1584,9 +1598,8 @@ class PlayerWidget(QWidget):
     def set_out_frame(self):
         if not self._path:
             return
-        f = self._current_frame
+        f = self._mc_offset() + self._current_frame   # always global
         if self._out_frame is not None and f == self._out_frame:
-            # Toggle off: clear out point
             self._out_frame = None
         elif self._in_frame is not None and f <= self._in_frame:
             return  # invalid: out must be after in
@@ -2536,10 +2549,18 @@ class PlayerWidget(QWidget):
     def _play(self, reverse: bool = False):
         if not self._path:
             return
-        if not reverse and self._current_frame >= self._effective_out():
-            self._seek_no_render(self._effective_in())
-        if reverse and self._current_frame <= self._effective_in():
-            self._seek_no_render(self._effective_out())
+        if self._mc_idx >= 0 and self._mc_clips:
+            global_pos = self._mc_offset() + self._current_frame
+            if not reverse and self._out_frame is not None and global_pos >= self._out_frame:
+                self._jump_to_global(self._in_frame if self._in_frame is not None else 0)
+            if reverse and self._in_frame is not None and global_pos <= self._in_frame:
+                self._jump_to_global(self._out_frame if self._out_frame is not None
+                                     else sum(c['total_frames'] for c in self._mc_clips) - 1)
+        else:
+            if not reverse and self._current_frame >= self._effective_out():
+                self._seek_no_render(self._effective_in())
+            if reverse and self._current_frame <= self._effective_in():
+                self._seek_no_render(self._effective_out())
 
         self._is_playing   = True
         self._play_reverse = reverse
@@ -2651,6 +2672,10 @@ class PlayerWidget(QWidget):
                 out  = min(self._effective_out(), len(self._frame_cache) - 1)
                 in_f = self._effective_in()
                 if target_frame > out:
+                    cache_out_reached = (
+                        self._out_frame is not None
+                        and out < len(self._frame_cache) - 1
+                    )
                     if self._loop and self._mc_idx < 0:
                         # Single-clip loop
                         self._play_frame_start = in_f
@@ -2664,7 +2689,7 @@ class PlayerWidget(QWidget):
                         self._scrubber.blockSignals(False)
                         self._update_info()
                     else:
-                        self._end_of_video()
+                        self._end_of_video(out_reached=cache_out_reached)
                     return
 
                 if target_frame <= self._current_frame:
@@ -2754,7 +2779,7 @@ class PlayerWidget(QWidget):
                             self._scrubber.blockSignals(False)
                             self._update_info()
                     else:
-                        self._end_of_video()
+                        self._end_of_video(out_reached=out_reached)
                     return
 
                 if raw is not None:
@@ -2823,6 +2848,35 @@ class PlayerWidget(QWidget):
     def _seek_no_render(self, frame_num: int):
         """Set current_frame without fetching (used before opening a pipe)."""
         self._current_frame = max(0, min(frame_num, self._total_frames - 1))
+
+    def _jump_to_global(self, global_frame: int):
+        """Switch to whichever clip owns global_frame and seek to its local position.
+        Used to jump to in/out points that may live in a different clip."""
+        if not (self._mc_idx >= 0 and self._mc_clips):
+            self._seek_no_render(global_frame)
+            return
+        local, target_idx = self._global_to_local(global_frame)
+        if target_idx != self._mc_idx:
+            next_clip = self._mc_clips[target_idx]
+            self._path            = next_clip['path']
+            self._fps             = next_clip['fps']
+            self._total_frames    = next_clip['total_frames']
+            self._vid_w           = next_clip['width']
+            self._vid_h           = next_clip['height']
+            self._is_hdr          = self._detect_hdr(next_clip['path'])
+            self._pix_fmt         = "rgb48le" if self._is_hdr else "rgb24"
+            self._bytes_per_pixel = 6 if self._is_hdr else 3
+            self._frame_cache     = self._mc_caches.get(next_clip['path'])
+            self._cache_loading   = False
+            self._gpu_cache_ready = False
+            self._gpu_upload_idx  = 0
+            self._reverse_cache   = []
+            self._loop_frame0     = None
+            self._mc_idx          = target_idx
+            if self._frame_cache is None:
+                self._start_cache_build()
+        self._current_frame = local
+        self._pipe_frame    = local
 
     def _show_frame(self, frame_num: int):
         if self._frame_cache and frame_num < len(self._frame_cache):
@@ -3083,9 +3137,33 @@ class PlayerWidget(QWidget):
             self._playlist_sidebar.set_current(path)
             QTimer.singleShot(0, self._refresh_display)
 
-    def _end_of_video(self):
-        """Called when the video reaches its natural end (no loop on single clip)."""
+    def _end_of_video(self, out_reached: bool = False):
+        """Called when playback hits the out-point or the natural end of a clip."""
         if self._mc_idx >= 0 and self._mc_clips:
+            # Out-point explicitly hit: loop back to in-point or stop entirely.
+            if out_reached:
+                if self._loop:
+                    target = self._in_frame if self._in_frame is not None else 0
+                    self._jump_to_global(target)
+                    self._audio.seek_to_clip(self._mc_idx)
+                    if self._frame_cache is None:
+                        self._open_pipe(self._current_frame)
+                    else:
+                        self._pipe_frame = self._current_frame
+                    self._play_frame_start = self._current_frame
+                    self._play_clock_start = time.monotonic()
+                    total = sum(c['total_frames'] for c in self._mc_clips)
+                    self._scrubber.blockSignals(True)
+                    self._scrubber.setRange(0, max(total - 1, 0))
+                    self._scrubber.setValue(self._mc_offset() + self._current_frame)
+                    self._scrubber.blockSignals(False)
+                    self._update_info()
+                else:
+                    self._audio.stop()
+                    self._pause()
+                    self.video_ended.emit()
+                return
+
             # "Loop this clip" flag: replay the current clip instead of advancing
             if self._mc_clips[self._mc_idx].get('loop_this', False):
                 next_idx = self._mc_idx
