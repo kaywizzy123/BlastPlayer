@@ -2567,6 +2567,8 @@ class PlayerWidget(QWidget):
         self._play_btn.setIcon(_icon("pause.png"))
         self._play_btn.setText("")
 
+        self._audio.set_speed(self._speed)
+
         if reverse:
             self._reverse_cache = []
         elif self._frame_cache is not None:
@@ -3112,6 +3114,7 @@ class PlayerWidget(QWidget):
 
     def _on_speed_changed(self, index: int):
         self._speed = self._SPEEDS[index]
+        self._audio.set_speed(self._speed)
         if self._is_playing:
             self._timer.setInterval(max(1, int(1000 / (self._fps * self._speed))))
 
@@ -3143,6 +3146,7 @@ class PlayerWidget(QWidget):
             # Out-point explicitly hit: loop back to in-point or stop entirely.
             if out_reached:
                 if self._loop:
+                    self._close_mc_next_pipe()   # stale pre-warm no longer valid
                     target = self._in_frame if self._in_frame is not None else 0
                     self._jump_to_global(target)
                     self._audio.seek_to_clip(self._mc_idx)

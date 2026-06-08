@@ -92,6 +92,9 @@ class AudioEngine(QObject):
         # Volume scalar applied in callback (0.0 – 1.0)
         self._volume: float = 1.0
 
+        # Playback speed multiplier — changes pitch along with tempo (simple resampling)
+        self._speed: float = 1.0
+
         # Frames-per-second of the currently loaded content
         self._fps: float = 24.0
 
@@ -309,6 +312,10 @@ class AudioEngine(QObject):
         """Set volume (0–100).  Takes effect on the next callback block."""
         self._volume = max(0.0, min(1.0, vol_0_100 / 100.0))
 
+    def set_speed(self, speed: float) -> None:
+        """Set playback speed multiplier.  Pitch shifts along with tempo."""
+        self._speed = max(0.05, speed)
+
     # ------------------------------------------------------------------
     # Status queries  (main thread)
     # ------------------------------------------------------------------
@@ -376,35 +383,53 @@ class AudioEngine(QObject):
         mode = self._mode
 
         if mode == self._PLAYING:
-            pos = self._play_pos
-            end = pos + frames
-            if pos >= len(pcm):
+            pos     = self._play_pos
+            spd     = self._speed
+            consume = max(1, round(frames * spd))
+            src_end = min(pos + consume, len(pcm))
+            n_src   = src_end - pos
+            if n_src <= 0:
                 outdata[:] = 0
                 self._mode = self._STOPPED
                 return
-            actual_end = min(end, len(pcm))
-            n = actual_end - pos
-            np.multiply(pcm[pos:actual_end], vol, out=outdata[:n])
-            if n < frames:
-                outdata[n:] = 0
+            src = pcm[pos:src_end]
+            if n_src == frames:
+                # Speed is effectively 1.0 — no resampling needed
+                np.multiply(src, vol, out=outdata)
+            else:
+                # Linear resample: stretch/compress n_src PCM samples → frames output
+                t  = np.linspace(0.0, n_src - 1.0, frames, dtype=np.float32)
+                i0 = t.astype(np.intp)
+                i1 = np.minimum(i0 + 1, n_src - 1)
+                frac = (t - i0)[:, None].astype(np.float32)
+                np.multiply(src[i0] + frac * (src[i1] - src[i0]), vol, out=outdata)
+            self._play_pos = src_end
+            if src_end >= len(pcm):
                 self._mode = self._STOPPED
-            self._play_pos = actual_end
 
         elif mode == self._PLAYING_REVERSE:
-            pos   = self._play_pos   # exclusive upper bound
-            start = pos - frames
-            if pos <= 0:
+            pos     = self._play_pos   # exclusive upper bound
+            spd     = self._speed
+            consume = max(1, round(frames * spd))
+            src_start = max(0, pos - consume)
+            n_src     = pos - src_start
+            if n_src <= 0:
                 outdata[:] = 0
                 self._mode = self._STOPPED
                 return
-            actual_start = max(0, start)
-            n = pos - actual_start
-            # Read the slice in reverse: index [pos-1, pos-2, ..., actual_start]
-            np.multiply(pcm[actual_start:pos][::-1], vol, out=outdata[:n])
-            if n < frames:
-                outdata[n:] = 0
+            # Read the slice in reverse order
+            src = pcm[src_start:pos][::-1]
+            if n_src == frames:
+                np.multiply(src, vol, out=outdata)
+            else:
+                t    = np.linspace(0.0, n_src - 1.0, frames, dtype=np.float32)
+                i0   = t.astype(np.intp)
+                i1   = np.minimum(i0 + 1, n_src - 1)
+                frac = (t - i0)[:, None].astype(np.float32)
+                np.multiply(src[i0] + frac * (src[i1] - src[i0]), vol, out=outdata)
+            self._play_pos = src_start
+            if src_start <= 0:
                 self._mode = self._STOPPED
-            self._play_pos = actual_start
 
         elif mode == self._SCRUBBING:
             pos = self._scrub_pos
