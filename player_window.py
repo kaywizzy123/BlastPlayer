@@ -889,19 +889,20 @@ class ScrubberSlider(QSlider):
         # Multi-clip bands: alternate a light tint on odd-indexed clips
         if len(self._mc_clips) > 1:
             total = self.maximum() + 1
-            band_color = QColor(255, 255, 255, 30)
-            div_color  = QColor(255, 255, 255, 80)
+            band_color = QColor(255, 255, 255, 70)
+            div_color  = QColor(255, 255, 255, 180)
+            bh = max(gh + 4, 8)   # band taller than the groove for visibility
             for i, clip in enumerate(self._mc_clips):
                 x_start = x_for(clip['offset'])
                 end_frame = clip['offset'] + clip['total_frames'] - 1
                 x_end = x_for(min(end_frame, self.maximum()))
                 if i % 2 == 1 and x_end > x_start:
-                    painter.fillRect(x_start, gy - gh // 2,
-                                     x_end - x_start, gh, band_color)
+                    painter.fillRect(x_start, gy - bh // 2,
+                                     x_end - x_start, bh, band_color)
                 # Divider at each clip boundary except the first
                 if i > 0:
-                    painter.setPen(QPen(div_color, 1))
-                    painter.drawLine(x_start, gy - gh, x_start, gy + gh)
+                    painter.setPen(QPen(div_color, 2))
+                    painter.drawLine(x_start, gy - bh // 2, x_start, gy + bh // 2)
 
         # Tinted range between in and out
         x_in  = x_for(self._in_frame  if self._in_frame  is not None else self.minimum())
