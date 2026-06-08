@@ -888,20 +888,24 @@ class ScrubberSlider(QSlider):
 
         # Multi-clip bands: alternate a light tint on odd-indexed clips
         if len(self._mc_clips) > 1:
-            total = self.maximum() + 1
             band_color = QColor(255, 255, 255, 70)
-            div_color  = QColor(255, 255, 255, 180)
+            div_color  = QColor(255, 255, 255, 100)
             bh = max(gh + 4, 8)   # band taller than the groove for visibility
-            for i, clip in enumerate(self._mc_clips):
+            clips = self._mc_clips
+            for i, clip in enumerate(clips):
                 x_start = x_for(clip['offset'])
-                end_frame = clip['offset'] + clip['total_frames'] - 1
-                x_end = x_for(min(end_frame, self.maximum()))
+                # Extend band to the pixel just before the next clip starts so
+                # there is no single-frame gap between adjacent bands.
+                if i < len(clips) - 1:
+                    x_end = x_for(clips[i + 1]['offset'])
+                else:
+                    x_end = x_for(self.maximum()) + 1
                 if i % 2 == 1 and x_end > x_start:
                     painter.fillRect(x_start, gy - bh // 2,
                                      x_end - x_start, bh, band_color)
                 # Divider at each clip boundary except the first
                 if i > 0:
-                    painter.setPen(QPen(div_color, 2))
+                    painter.setPen(QPen(div_color, 1))
                     painter.drawLine(x_start, gy - bh // 2, x_start, gy + bh // 2)
 
         # Tinted range between in and out
@@ -1082,8 +1086,9 @@ void main() {
             return
         self.makeCurrent()
         glDeleteTextures(len(self._tex_pool), self._tex_pool)
-        self._tex_pool  = []
-        self._tex_cache = {}
+        self._tex_pool    = []
+        self._tex_cache   = {}
+        self._draw_tex_id = None   # don't reference deleted textures
 
     # ── OCIO API ─────────────────────────────────────────────────────── #
 
@@ -1166,7 +1171,9 @@ void main() {
         # ── Determine which texture to render ────────────────────────── #
         if have_cached:
             render_tex = self._draw_tex_id
-            self._draw_tex_id = None
+            # Keep _draw_tex_id set — subsequent repaints (e.g. scrubber update)
+            # must re-render the same cached frame, not fall back to the stale
+            # scratch texture (_tex_id) which may hold a frame from a different clip.
         else:
             render_tex = self._tex_id
             if self._dirty:
@@ -1441,6 +1448,7 @@ class PlayerWidget(QWidget):
         # GPU texture cache — frames uploaded to VideoCanvas texture pool
         self._gpu_cache_ready   = False
         self._gpu_upload_idx    = 0
+        self._gpu_build_gen     = 0   # incremented on each new build; cancels stale batches
 
         # Reverse frame cache
         self._reverse_cache   = []      # list of (frame_num, raw_bytes), pop() = backward
@@ -1768,6 +1776,7 @@ class PlayerWidget(QWidget):
         self._cache_loading    = False
         self._gpu_cache_ready  = False
         self._gpu_upload_idx   = 0
+        self._gpu_build_gen   += 1   # cancel any in-flight upload batch for the old clip
         self._is_hdr           = self._detect_hdr(clip['path'])
         self._pix_fmt          = "rgb48le" if self._is_hdr else "rgb24"
         self._bytes_per_pixel  = 6         if self._is_hdr else 3
@@ -2303,10 +2312,14 @@ class PlayerWidget(QWidget):
             return
         self._gpu_cache_ready = False
         self._gpu_upload_idx  = 0
+        self._gpu_build_gen  += 1
         self._canvas.begin_gpu_cache(max_frames, w, h, self._is_hdr)
-        QTimer.singleShot(0, self._gpu_upload_batch)
+        gen = self._gpu_build_gen
+        QTimer.singleShot(0, lambda: self._gpu_upload_batch(gen))
 
-    def _gpu_upload_batch(self):
+    def _gpu_upload_batch(self, gen: int):
+        if gen != self._gpu_build_gen:
+            return   # a newer build started — this batch is stale, discard
         if not self._frame_cache:
             return
         pool_size = len(self._canvas._tex_pool)
@@ -2317,7 +2330,7 @@ class PlayerWidget(QWidget):
                 return
             self._canvas.upload_gpu_frame(idx, self._frame_cache[idx])
             self._gpu_upload_idx += 1
-        QTimer.singleShot(0, self._gpu_upload_batch)
+        QTimer.singleShot(0, lambda: self._gpu_upload_batch(gen))
 
     # ------------------------------------------------------------------ #
     #  UI                                                                  #
@@ -2872,6 +2885,7 @@ class PlayerWidget(QWidget):
             self._cache_loading   = False
             self._gpu_cache_ready = False
             self._gpu_upload_idx  = 0
+            self._gpu_build_gen  += 1
             self._reverse_cache   = []
             self._loop_frame0     = None
             self._mc_idx          = target_idx
@@ -2955,6 +2969,7 @@ class PlayerWidget(QWidget):
                 self._cache_loading   = False
                 self._gpu_cache_ready = False
                 self._gpu_upload_idx  = 0
+                self._gpu_build_gen  += 1
                 self._reverse_cache   = []
                 self._loop_frame0     = None
                 self._mc_idx          = target_idx
@@ -3362,6 +3377,7 @@ class PlayerWidget(QWidget):
         self._cache_loading    = False
         self._gpu_cache_ready  = False
         self._gpu_upload_idx   = 0
+        self._gpu_build_gen   += 1
         self._is_hdr           = False
         self._pix_fmt          = "rgb24"
         self._bytes_per_pixel  = 3
