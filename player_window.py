@@ -34,6 +34,7 @@ import queue
 import threading
 import subprocess
 import tempfile
+import ctypes
 from pathlib import Path
 
 from core.audio_engine import AudioEngine
@@ -61,6 +62,8 @@ try:
         glGenTextures, glDeleteTextures, glBindTexture,
         glTexImage2D, glTexSubImage2D, glTexImage3D,
         glTexParameteri, glActiveTexture, glUniform1i,
+        glGenBuffers, glBindBuffer, glBufferData, glBufferSubData,
+        glMapBufferRange, glUnmapBuffer,
         GL_COLOR_BUFFER_BIT, GL_TRIANGLES, GL_FLOAT,
         GL_TEXTURE_2D, GL_TEXTURE_3D,
         GL_RGB, GL_RGBA, GL_RGB8, GL_RGB16, GL_RGBA32F,
@@ -69,6 +72,8 @@ try:
         GL_LINEAR, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
         GL_CLAMP_TO_EDGE, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
         GL_TEXTURE_WRAP_R,
+        GL_PIXEL_UNPACK_BUFFER, GL_STREAM_DRAW,
+        GL_MAP_WRITE_BIT, GL_MAP_INVALIDATE_BUFFER_BIT,
     )
 except ImportError:
     raise SystemExit(
@@ -1047,6 +1052,8 @@ void main() {
         self._tex_id     = None   # streaming texture for set_frame()
         self._tex_w      = 0
         self._tex_h      = 0
+        self._pbos       = None   # two PBOs for async CPU→GPU upload (set in initializeGL)
+        self._pbo_idx    = 0
 
         # GPU texture cache
         self._tex_pool      = []   # list[int] — pre-allocated texture IDs
@@ -1199,6 +1206,10 @@ void main() {
         self._tex_id = int(glGenTextures(1))
         self._alloc_texture(self._tex_id, 0, 0, False)
 
+        # Two PBOs for async CPU→GPU texture upload (double-buffer orphaning)
+        self._pbos    = glGenBuffers(2)
+        self._pbo_idx = 0
+
         self._rebuild_shader()
         glClearColor(0, 0, 0, 1)
 
@@ -1230,12 +1241,39 @@ void main() {
                 else:
                     int_fmt, gl_type = GL_RGB8, GL_UNSIGNED_BYTE
                 if w != self._tex_w or h != self._tex_h or self._is_hdr != getattr(self, '_tex_hdr', False):
+                    # First allocation for these dimensions — synchronous upload is fine.
                     glTexImage2D(GL_TEXTURE_2D, 0, int_fmt, w, h, 0,
                                  GL_RGB, gl_type, self._frame_raw)
                     self._tex_w   = w
                     self._tex_h   = h
                     self._tex_hdr = self._is_hdr
+                elif self._pbos is not None:
+                    # Async PBO upload: CPU writes to PBO, GPU DMAs to VRAM in background.
+                    data_size = len(self._frame_raw)
+                    pbo = self._pbos[self._pbo_idx]
+                    self._pbo_idx = 1 - self._pbo_idx
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo)
+                    # Orphan the buffer so the driver gives us fresh memory without stalling.
+                    glBufferData(GL_PIXEL_UNPACK_BUFFER, data_size, None, GL_STREAM_DRAW)
+                    ptr = glMapBufferRange(
+                        GL_PIXEL_UNPACK_BUFFER, 0, data_size,
+                        GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT,
+                    )
+                    if ptr is not None:
+                        ctypes.memmove(ptr, self._frame_raw, data_size)
+                        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)
+                        # PBO bound → last arg is byte-offset, not a data pointer.
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                                        GL_RGB, gl_type, ctypes.c_void_p(0))
+                    else:
+                        # Map failed — fall back to synchronous upload.
+                        glBufferData(GL_PIXEL_UNPACK_BUFFER, 0, None, GL_STREAM_DRAW)
+                        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                                        GL_RGB, gl_type, self._frame_raw)
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
                 else:
+                    # PBOs not ready yet (initializeGL hasn't run) — synchronous fallback.
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
                                     GL_RGB, gl_type, self._frame_raw)
                 glBindTexture(GL_TEXTURE_2D, 0)
@@ -1439,7 +1477,7 @@ class PlayerWidget(QWidget):
     _SPEEDS             = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
     _SPEED_LABELS       = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
     _CACHE_MAX_MB       = 2048   # skip CPU RAM cache if decoded frames exceed this
-    _PREFETCH_QUEUE_SIZE = 16    # frames buffered ahead in the pipe reader thread
+    _PREFETCH_QUEUE_SIZE = 64    # frames buffered ahead in the pipe reader thread
 
     video_ended          = pyqtSignal()
     audio_loading        = pyqtSignal(bool)
@@ -1530,8 +1568,7 @@ class PlayerWidget(QWidget):
         self._pre_mute_volume = 100
         self._audio = AudioEngine(self)
         self._audio.set_volume(self._volume)
-        self._audio.load_finished.connect(
-            lambda *_: self.audio_loading.emit(False))
+        self._audio.load_finished.connect(self._on_audio_load_finished)
 
         # Scrub-ahead seek debounce — pre-warms ffmpeg pipe at drag target
         self._scrub_seek_debounce = QTimer(self)
@@ -1594,7 +1631,13 @@ class PlayerWidget(QWidget):
         self._update_info()
         self.audio_loading.emit(True)
         self._audio.load(path, self._fps)
-        self._start_cache_build()
+        # Delay cache build so the initial pipe (and any autoplay) get first
+        # access to I/O — avoids competing for disk bandwidth at the hot moment.
+        _path_at_load = path
+        QTimer.singleShot(
+            1500,
+            lambda: self._start_cache_build() if self._path == _path_at_load else None
+        )
         if self._autoplay:
             self._play()
         return True
@@ -1756,7 +1799,7 @@ class PlayerWidget(QWidget):
         nbytes   = w * h * bpp
         src      = self._exr_seq_pattern(clip['path']) if is_hdr else clip['path']
         cmd = [
-            _ffmpeg_exe(),
+            _ffmpeg_exe(), "-hwaccel", "auto",
             "-i",       src,
             "-f",       "rawvideo",
             "-pix_fmt", pix_fmt,
@@ -1966,7 +2009,7 @@ class PlayerWidget(QWidget):
         fine_ts           = pre_offset_frames / self._fps
 
         src = self._exr_seq_pattern(self._path) if self._is_hdr else self._path
-        cmd = [_ffmpeg_exe()]
+        cmd = [_ffmpeg_exe(), "-hwaccel", "auto"]
         if pre_ts > 0:
             cmd += ["-ss", f"{pre_ts:.6f}"]
         cmd += [
@@ -2035,7 +2078,7 @@ class PlayerWidget(QWidget):
 
         def _fill():
             cmd = [
-                _ffmpeg_exe(),
+                _ffmpeg_exe(), "-hwaccel", "auto",
                 "-i",       src,
                 "-f",       "rawvideo",
                 "-pix_fmt", pix_fmt,
@@ -2093,7 +2136,7 @@ class PlayerWidget(QWidget):
             nf  = clip['total_frames']
 
             def _fill(p=path, s=src, pf=pix_fmt, nb=frame_size, n=nf, v=vf):
-                cmd = [_ffmpeg_exe(), "-i", s,
+                cmd = [_ffmpeg_exe(), "-hwaccel", "auto", "-i", s,
                        "-f", "rawvideo", "-pix_fmt", pf,
                        "-vf", v, "pipe:1"]
                 frames = []
@@ -2126,7 +2169,7 @@ class PlayerWidget(QWidget):
         self._loop_pipe_queue = queue.Queue(maxsize=self._PREFETCH_QUEUE_SIZE)
         src = self._exr_seq_pattern(self._path) if self._is_hdr else self._path
         cmd = [
-            _ffmpeg_exe(),
+            _ffmpeg_exe(), "-hwaccel", "auto",
             "-i",       src,
             "-f",       "rawvideo",
             "-pix_fmt", self._pix_fmt,
@@ -2233,7 +2276,7 @@ class PlayerWidget(QWidget):
             pre_ts     = pre_frame  / self._fps
             fine_ts    = pre_offset / self._fps
 
-            cmd = [_ffmpeg_exe()]
+            cmd = [_ffmpeg_exe(), "-hwaccel", "auto"]
             if pre_ts > 0:
                 cmd += ["-ss", f"{pre_ts:.6f}"]
             cmd += [
@@ -2291,7 +2334,7 @@ class PlayerWidget(QWidget):
         pre_ts    = pre_frame / self._fps
         fine_ts   = pre_offset_frames / self._fps
 
-        cmd = [_ffmpeg_exe()]
+        cmd = [_ffmpeg_exe(), "-hwaccel", "auto"]
         if pre_ts > 0:
             cmd += ["-ss", f"{pre_ts:.6f}"]
         cmd += [
@@ -3296,6 +3339,16 @@ class PlayerWidget(QWidget):
             self._vol_slider.setValue(0)
         else:
             self._vol_slider.setValue(self._pre_mute_volume)
+
+    def _on_audio_load_finished(self, ok: bool) -> None:
+        """Called on the Qt thread when background PCM decode completes."""
+        self.audio_loading.emit(False)
+        # Start audio from the current video position if playing forward,
+        # single-clip, and not mid-scrub (scrub sets _is_playing=True but
+        # stops the timer — starting audio here would play under the drag).
+        if (ok and self._is_playing and not self._play_reverse
+                and self._mc_idx < 0 and not self._scrubber_moving):
+            self._audio.play(self._current_frame)
 
     def _on_volume_changed(self, value: int):
         self._volume = value

@@ -99,10 +99,11 @@ class AudioEngine(QObject):
         self._fps: float = 24.0
 
         # Callback state — read by audio thread, written by main thread
-        self._mode:       int = self._STOPPED
-        self._play_pos:   int = 0   # next sample to output in PLAYING mode
-        self._scrub_pos:  int = 0   # current read pointer in SCRUBBING mode
-        self._scrub_end:  int = 0   # exclusive end sample for current snippet
+        self._mode:            int = self._STOPPED
+        self._play_pos:        int = 0   # next sample to output in PLAYING mode
+        self._play_start_pos:  int = 0   # sample at which current play() started
+        self._scrub_pos:       int = 0   # current read pointer in SCRUBBING mode
+        self._scrub_end:       int = 0   # exclusive end sample for current snippet
 
         # Rate-limit scrub snippet restarts
         self._last_scrub_t: float = 0.0
@@ -252,6 +253,7 @@ class AudioEngine(QObject):
         if self._pcm is None:
             return
         self._play_pos = self._frame_to_sample(frame)
+        self._play_start_pos = self._play_pos
         self._mode = self._PLAYING
 
     def stop(self) -> None:
@@ -328,6 +330,24 @@ class AudioEngine(QObject):
 
     def duration_samples(self) -> int:
         return len(self._pcm) if self._pcm is not None else 0
+
+    def audio_clock_elapsed(self) -> float:
+        """
+        Content-seconds elapsed since play() was last called.
+
+        Returns -1.0 when audio is not actively playing (not loaded, stopped,
+        scrubbing, or reverse-playing) so callers can fall back to wall-clock.
+
+        The value is derived from _play_pos which the PortAudio callback
+        advances at speed × SAMPLE_RATE samples per wall-second, so speed is
+        already factored in — callers must NOT multiply by self._speed again.
+        """
+        if self._mode != self._PLAYING or self._pcm is None:
+            return -1.0
+        elapsed_samples = self._play_pos - self._play_start_pos
+        if elapsed_samples < 0:
+            return -1.0
+        return elapsed_samples / self.SAMPLE_RATE
 
     # ------------------------------------------------------------------
     # Multi-clip helpers
