@@ -47,7 +47,7 @@ from PyQt5.QtWidgets import (
     QFrame, QToolButton, QActionGroup, QComboBox, QShortcut,
     QOpenGLWidget, QListWidget, QListWidgetItem, QMenu, QDockWidget,
     QApplication, QLineEdit, QInputDialog, QProgressBar,
-    QStyledItemDelegate, QAbstractItemView, QStyle,
+    QStyledItemDelegate, QAbstractItemView, QStyle, QSizeGrip,
 )
 from PyQt5.QtCore import Qt, QTimer, QSize, QRect, QThread, pyqtSignal, QSettings, QObject
 from PyQt5.QtGui import (
@@ -3845,7 +3845,8 @@ class PlayerWidget(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _PlaylistDock(QDockWidget):
-    """QDockWidget that corrects the Windows y=0 content-overlap bug.
+    """QDockWidget that corrects the Windows y=0 content-overlap bug and adds
+    a wide resize zone when floating.
 
     When setTitleBarWidget is used on Windows, QDockWidgetLayout positions the
     content widget at y=0 (behind the custom title bar) instead of y=title_h.
@@ -3858,7 +3859,21 @@ class _PlaylistDock(QDockWidget):
       applied inline, so we need to correct it on the next event-loop tick too.
     Native drag-to-dock behaviour (drop indicators, area snapping) is fully
     preserved because setTitleBarWidget is used normally.
+
+    Resize usability:
+    - A QSizeGrip is shown at the bottom-right corner when floating.
+    - On Windows, nativeEvent intercepts WM_NCHITTEST to extend the resize
+      hit zone to _RESIZE_MARGIN px on all non-title-bar edges so users can
+      grab without pixel-perfect accuracy.
     """
+
+    _RESIZE_MARGIN = 8  # pixels inward from edge treated as resize zone
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._grip = QSizeGrip(self)
+        self._grip.setFixedSize(18, 18)
+        self._grip.hide()
 
     def _fix_content_pos(self) -> None:
         tb = self.titleBarWidget()
@@ -3868,6 +3883,15 @@ class _PlaylistDock(QDockWidget):
         th = tb.height()
         if th > 0:
             w.setGeometry(0, th, self.width(), max(0, self.height() - th))
+        # Show size grip in bottom-right corner only when floating
+        gs = self._grip.width()
+        if self.isFloating():
+            self._grip.setGeometry(
+                self.width() - gs, self.height() - gs, gs, gs)
+            self._grip.raise_()
+            self._grip.show()
+        else:
+            self._grip.hide()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -3882,6 +3906,33 @@ class _PlaylistDock(QDockWidget):
         super().changeEvent(event)
         self._fix_content_pos()
         QTimer.singleShot(0, self._fix_content_pos)
+
+    def nativeEvent(self, event_type, message):
+        if sys.platform == "win32" and self.isFloating():
+            try:
+                import ctypes.wintypes as wt
+                msg = wt.MSG.from_address(int(message))
+                if msg.message == 0x0084:             # WM_NCHITTEST
+                    x  = ctypes.c_int16(msg.lParam & 0xFFFF).value
+                    y  = ctypes.c_int16((msg.lParam >> 16) & 0xFFFF).value
+                    geo = self.geometry()
+                    lx, ly = x - geo.left(), y - geo.top()
+                    m,  w,  h  = self._RESIZE_MARGIN, self.width(), self.height()
+                    tb = self.titleBarWidget()
+                    th = tb.height() if tb else 34    # title-bar height
+
+                    bottom = ly > h - m
+                    left   = lx < m
+                    right  = lx > w - m and ly >= th  # keep title-bar buttons clickable
+
+                    if   bottom and left:  return True, 16  # HTBOTTOMLEFT
+                    elif bottom and right: return True, 17  # HTBOTTOMRIGHT
+                    elif bottom:           return True, 15  # HTBOTTOM
+                    elif left:             return True, 10  # HTLEFT
+                    elif right:            return True, 11  # HTRIGHT
+            except Exception:
+                pass
+        return super().nativeEvent(event_type, message)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
