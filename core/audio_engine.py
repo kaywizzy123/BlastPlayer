@@ -180,31 +180,44 @@ class AudioEngine(QObject):
         paths = ([c["path"] for c in mc_clips] if mc_clips else [path])
         t = threading.Thread(
             target=self._decode_worker,
-            args=(paths,),
+            args=(paths, mc_clips),
             daemon=True,
         )
         self._decode_thread = t
         t.start()
 
-    def _decode_worker(self, paths: list[str]) -> None:
-        ffmpeg = _ffmpeg_exe()
+    def _decode_worker(self, paths: list[str],
+                       mc_clips: list[dict] | None = None) -> None:
+        ffmpeg   = _ffmpeg_exe()
         chunks: list[np.ndarray] = []
         offsets: list[int] = []
-        cursor = 0
+        cursor   = 0
+        has_audio = False
 
-        for p in paths:
+        for i, p in enumerate(paths):
             if self._cancel_decode.is_set():
                 break
             chunk = self._decode_file(ffmpeg, p)
+            offsets.append(cursor)
             if chunk is not None and len(chunk):
-                offsets.append(cursor)
-                cursor += len(chunk)
+                has_audio = True
+                cursor   += len(chunk)
                 chunks.append(chunk)
-            else:
-                offsets.append(cursor)
+            elif mc_clips and i < len(mc_clips):
+                # Clip has no audio track — insert silence so every subsequent
+                # clip's sample offset stays correctly aligned with the timeline.
+                clip     = mc_clips[i]
+                clip_fps = clip.get('fps', self._fps)
+                n_frames = clip.get('total_frames', 0)
+                if clip_fps > 0 and n_frames > 0:
+                    n_samples = int(n_frames / clip_fps * self.SAMPLE_RATE)
+                    if n_samples > 0:
+                        silence = np.zeros((n_samples, self.CHANNELS), dtype=np.float32)
+                        chunks.append(silence)
+                        cursor += n_samples
 
-        ok = bool(chunks)
-        if ok and not self._cancel_decode.is_set():
+        ok = has_audio and not self._cancel_decode.is_set()
+        if chunks and not self._cancel_decode.is_set():
             self._pcm = np.concatenate(chunks, axis=0)
             self._sample_offsets = offsets
 
