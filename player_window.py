@@ -3697,8 +3697,11 @@ class PlayerWidget(QWidget):
         """
         self._close_lookahead()
         self._close_loop_pipe()
-        self._frame_cache   = None
-        self._cache_loading = False
+        self._frame_cache     = None
+        self._cache_loading   = False
+        self._gpu_cache_ready = False
+        self._gpu_upload_idx  = 0
+        self._gpu_build_gen  += 1
         if self._use_window:
             self._stop_wnd_fwd()
             self._stop_wnd_bwd()
