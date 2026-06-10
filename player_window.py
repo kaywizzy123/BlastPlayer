@@ -3523,51 +3523,47 @@ class PlayerWidget(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main window
 # ══════════════════════════════════════════════════════════════════════════════
-#  Dock drag helper
+#  Playlist dock widget
 # ══════════════════════════════════════════════════════════════════════════════
 
-class _DockDragHelper(QObject):
-    """Enables undocking and floating-window drag via a surrogate header widget.
+class _PlaylistDock(QDockWidget):
+    """QDockWidget that corrects the Windows y=0 content-overlap bug.
 
-    Used alongside a zero-height setTitleBarWidget so that the dock layout
-    positions content correctly on Windows while drag-to-float still works.
-    Drag the header background to undock / move; child buttons still fire.
+    When setTitleBarWidget is used on Windows, QDockWidgetLayout positions the
+    content widget at y=0 (behind the custom title bar) instead of y=title_h.
+
+    Fix strategy:
+    - resizeEvent: fix synchronously — by the time resizeEvent is called Qt has
+      already laid out children, so our setGeometry call wins for that frame.
+    - showEvent / changeEvent: also fix deferred (singleShot 0) because on first
+      show and on dock/undock transitions the layout may be posted rather than
+      applied inline, so we need to correct it on the next event-loop tick too.
+    Native drag-to-dock behaviour (drop indicators, area snapping) is fully
+    preserved because setTitleBarWidget is used normally.
     """
 
-    def __init__(self, dock: QDockWidget, header: QWidget) -> None:
-        super().__init__(dock)
-        self._dock         = dock
-        self._press_pos    = None   # global QPoint at press
-        self._drag_offset  = None   # cursor offset from dock frame origin
-        self._drag_started = False
-        header.installEventFilter(self)
+    def _fix_content_pos(self) -> None:
+        tb = self.titleBarWidget()
+        w  = self.widget()
+        if not tb or not w:
+            return
+        th = tb.height()
+        if th > 0:
+            w.setGeometry(0, th, self.width(), max(0, self.height() - th))
 
-    def eventFilter(self, obj, event) -> bool:
-        t = event.type()
-        if t == event.MouseButtonPress and event.button() == Qt.LeftButton:
-            self._press_pos    = event.globalPos()
-            self._drag_offset  = event.globalPos() - self._dock.frameGeometry().topLeft()
-            self._drag_started = False
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fix_content_pos()                       # sync: layout already ran
 
-        elif t == event.MouseMove and event.buttons() & Qt.LeftButton:
-            if self._press_pos is None:
-                return False
-            if not self._drag_started:
-                d = event.globalPos() - self._press_pos
-                if abs(d.x()) + abs(d.y()) >= QApplication.startDragDistance():
-                    self._drag_started = True
-            if self._drag_started:
-                if not self._dock.isFloating():
-                    self._dock.setFloating(True)
-                    self._drag_offset = event.globalPos() - self._dock.frameGeometry().topLeft()
-                self._dock.move(event.globalPos() - self._drag_offset)
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._fix_content_pos()                       # best-effort immediate
+        QTimer.singleShot(0, self._fix_content_pos)  # deferred: layout may be posted
 
-        elif t == event.MouseButtonRelease and event.button() == Qt.LeftButton:
-            self._press_pos    = None
-            self._drag_offset  = None
-            self._drag_started = False
-
-        return False  # never consume — child buttons must still receive events
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        self._fix_content_pos()
+        QTimer.singleShot(0, self._fix_content_pos)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3711,8 +3707,9 @@ class BlastPlayerWindow(QMainWindow):
     def _build_playlist_dock(self):
         self._playlist = PlaylistSidebar()
 
-        self._playlist_dock = QDockWidget(self)
+        self._playlist_dock = _PlaylistDock(self)
         self._playlist_dock.setObjectName("PlaylistDock")
+        self._playlist_dock.setWidget(self._playlist)
         self._playlist_dock.setAllowedAreas(
             Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._playlist_dock.setFeatures(
@@ -3721,27 +3718,8 @@ class BlastPlayerWindow(QMainWindow):
             QDockWidget.DockWidgetClosable)
         self._playlist_dock.setStyleSheet(
             f"QDockWidget {{ border: 1px solid {constants.SPLITTER_COLOR}; }}")
-
-        # Suppress the native title bar with a zero-height widget to avoid the
-        # Windows bug where setTitleBarWidget places content starting at y=0,
-        # overlapping the title bar area regardless of layout.
-        null_title = QWidget()
-        null_title.setFixedHeight(0)
-        self._playlist_dock.setTitleBarWidget(null_title)
-
-        # Header and sidebar content live in a plain QVBoxLayout so y-positioning
-        # is handled entirely by Qt's normal layout engine.  Float/dock is done
-        # via the button that add_dock_buttons injects into _hdr.
         self._playlist.add_dock_buttons(self._playlist_dock)
-        _container = QWidget()
-        _vbox = QVBoxLayout(_container)
-        _vbox.setContentsMargins(0, 0, 0, 0)
-        _vbox.setSpacing(0)
-        _vbox.addWidget(self._playlist._hdr)
-        _vbox.addWidget(self._playlist)
-        self._playlist_dock.setWidget(_container)
-        _DockDragHelper(self._playlist_dock, self._playlist._hdr)
-
+        self._playlist_dock.setTitleBarWidget(self._playlist._hdr)
         self._playlist_dock.setVisible(False)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._playlist_dock)
 
