@@ -1476,8 +1476,10 @@ class PlayerWidget(QWidget):
 
     _SPEEDS             = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
     _SPEED_LABELS       = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
-    _CACHE_MAX_MB       = 2048   # skip CPU RAM cache if decoded frames exceed this
-    _PREFETCH_QUEUE_SIZE = 64    # frames buffered ahead in the pipe reader thread
+    _CACHE_MAX_MB        = 2048   # skip CPU RAM cache if decoded frames exceed this
+    _PREFETCH_QUEUE_SIZE = 64     # frames buffered ahead in the pipe reader thread
+    _WINDOW_BUDGET_MB    = 4096   # sliding-window RAM budget for large-video playback
+    _WINDOW_FWD_FRAC     = 0.65   # fraction of window kept ahead of the playhead
 
     video_ended          = pyqtSignal()
     audio_loading        = pyqtSignal(bool)
@@ -1533,6 +1535,18 @@ class PlayerWidget(QWidget):
         self._loop_pipe_thread = None
         self._loop_reader_stop = threading.Event()
 
+        # Sliding window cache (Tier-2: large videos that exceed _CACHE_MAX_MB)
+        self._use_window      = False
+        self._wnd: dict       = {}          # frame_number → raw_bytes
+        self._wnd_fwd_size    = 0           # frames to keep ahead of playhead
+        self._wnd_bwd_size    = 0           # frames to keep behind playhead
+        self._wnd_fwd_proc    = None
+        self._wnd_fwd_thread  = None
+        self._wnd_fwd_stop    = threading.Event()
+        self._wnd_bwd_proc    = None
+        self._wnd_bwd_thread  = None
+        self._wnd_bwd_stop    = threading.Event()
+
         # RAM frame cache — all frames decoded into memory for zero-latency playback
         self._frame_cache   = None   # list[bytes] once ready, None while not cached
         self._cache_loading = False  # True while background decode is running
@@ -1573,8 +1587,7 @@ class PlayerWidget(QWidget):
         # Scrub-ahead seek debounce — pre-warms ffmpeg pipe at drag target
         self._scrub_seek_debounce = QTimer(self)
         self._scrub_seek_debounce.setSingleShot(True)
-        self._scrub_seek_debounce.timeout.connect(
-            lambda: self._prime_scrub_pipe(self._scrubber.value()))
+        self._scrub_seek_debounce.timeout.connect(self._on_scrub_seek_debounce)
 
         # Misc state
         self._scrubber_moving = False
@@ -1631,13 +1644,23 @@ class PlayerWidget(QWidget):
         self._update_info()
         self.audio_loading.emit(True)
         self._audio.load(path, self._fps)
-        # Delay cache build so the initial pipe (and any autoplay) get first
-        # access to I/O — avoids competing for disk bandwidth at the hot moment.
-        _path_at_load = path
-        QTimer.singleShot(
-            1500,
-            lambda: self._start_cache_build() if self._path == _path_at_load else None
-        )
+
+        frame_bytes = self._frame_nbytes()
+        total_mb    = (self._total_frames * frame_bytes) / 1_048_576 if frame_bytes > 0 else 0
+        if total_mb > self._CACHE_MAX_MB:
+            # Tier 2: too large for full RAM cache — use sliding window
+            self._use_window = True
+            self._wnd_compute_sizes()
+            self._wnd_anchor_at(0)
+        else:
+            # Tier 1: fits in budget — build full cache after a short delay
+            # to avoid competing for I/O with the initial pipe/autoplay.
+            _path_at_load = path
+            QTimer.singleShot(
+                1500,
+                lambda: self._start_cache_build() if self._path == _path_at_load else None
+            )
+
         if self._autoplay:
             self._play()
         return True
@@ -2161,6 +2184,168 @@ class PlayerWidget(QWidget):
 
             threading.Thread(target=_fill, daemon=True).start()
 
+    # ── Sliding window cache ─────────────────────────────────────────────── #
+
+    def _wnd_compute_sizes(self) -> None:
+        budget      = self._WINDOW_BUDGET_MB * 1_048_576
+        frame_bytes = self._frame_nbytes()
+        if frame_bytes <= 0:
+            return
+        total             = budget // frame_bytes
+        self._wnd_fwd_size = int(total * self._WINDOW_FWD_FRAC)
+        self._wnd_bwd_size = total - self._wnd_fwd_size
+
+    def _wnd_anchor_at(self, frame: int) -> None:
+        """Stop fill threads, evict stale frames, restart fill around *frame*."""
+        self._stop_wnd_fwd()
+        self._stop_wnd_bwd()
+        lo = max(0, frame - self._wnd_bwd_size)
+        hi = min(self._total_frames - 1, frame + self._wnd_fwd_size)
+        for f in list(self._wnd):
+            if f < lo or f > hi:
+                del self._wnd[f]
+        # Forward fill: start from first uncached frame at or after *frame*
+        fwd_start = frame
+        while fwd_start <= hi and fwd_start in self._wnd:
+            fwd_start += 1
+        if fwd_start < self._total_frames:
+            self._start_wnd_fwd(fwd_start)
+        # Backward fill: fill frames before *frame* down to lo
+        if frame - 1 >= lo:
+            self._start_wnd_bwd(lo, frame - 1)
+
+    def _start_wnd_fwd(self, start_frame: int) -> None:
+        if not self._path or not self._vid_w:
+            return
+        src        = self._exr_seq_pattern(self._path) if self._is_hdr else self._path
+        pre_offset = min(start_frame, int(self._fps * 4))
+        pre_frame  = start_frame - pre_offset
+        pre_ts     = pre_frame / self._fps
+        fine_ts    = pre_offset / self._fps
+        cmd = [_ffmpeg_exe(), "-hwaccel", "auto"]
+        if pre_ts > 0:
+            cmd += ["-ss", f"{pre_ts:.6f}"]
+        cmd += ["-i", src, "-ss", f"{fine_ts:.6f}",
+                "-f", "rawvideo", "-pix_fmt", self._pix_fmt,
+                "-vf", self._build_vf(), "pipe:1"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception:
+            return
+        self._wnd_fwd_proc = proc
+        self._wnd_fwd_stop.clear()
+        frame_size = self._frame_nbytes()
+        fwd_size   = self._wnd_fwd_size
+        stop       = self._wnd_fwd_stop
+        wnd        = self._wnd
+
+        def _fill():
+            fn    = start_frame
+            total = self._total_frames
+            while not stop.is_set() and fn < total:
+                if fn - self._current_frame > fwd_size:
+                    time.sleep(0.01)
+                    continue
+                try:
+                    raw = proc.stdout.read(frame_size)
+                except Exception:
+                    break
+                if len(raw) < frame_size:
+                    break
+                wnd[fn] = bytes(raw)
+                fn += 1
+            try:
+                proc.stdout.close()
+                proc.terminate()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_fill, daemon=True, name="wnd-fwd")
+        self._wnd_fwd_thread = t
+        t.start()
+
+    def _start_wnd_bwd(self, start_frame: int, end_frame: int) -> None:
+        if not self._path or not self._vid_w or start_frame > end_frame:
+            return
+        src        = self._exr_seq_pattern(self._path) if self._is_hdr else self._path
+        pre_offset = min(start_frame, int(self._fps * 4))
+        pre_frame  = start_frame - pre_offset
+        pre_ts     = pre_frame / self._fps
+        fine_ts    = pre_offset / self._fps
+        count      = end_frame - start_frame + 1
+        cmd = [_ffmpeg_exe(), "-hwaccel", "auto"]
+        if pre_ts > 0:
+            cmd += ["-ss", f"{pre_ts:.6f}"]
+        cmd += ["-i", src, "-ss", f"{fine_ts:.6f}",
+                "-frames:v", str(count),
+                "-f", "rawvideo", "-pix_fmt", self._pix_fmt,
+                "-vf", self._build_vf(), "pipe:1"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception:
+            return
+        self._wnd_bwd_proc = proc
+        self._wnd_bwd_stop.clear()
+        frame_size = self._frame_nbytes()
+        stop       = self._wnd_bwd_stop
+        wnd        = self._wnd
+
+        def _fill():
+            fn = start_frame
+            while not stop.is_set() and fn <= end_frame:
+                try:
+                    raw = proc.stdout.read(frame_size)
+                except Exception:
+                    break
+                if len(raw) < frame_size:
+                    break
+                wnd[fn] = bytes(raw)
+                fn += 1
+            try:
+                proc.stdout.close()
+                proc.terminate()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_fill, daemon=True, name="wnd-bwd")
+        self._wnd_bwd_thread = t
+        t.start()
+
+    def _stop_wnd_fwd(self) -> None:
+        self._wnd_fwd_stop.set()
+        self._wnd_fwd_thread = None
+        if self._wnd_fwd_proc is not None:
+            try:
+                self._wnd_fwd_proc.stdout.close()
+                self._wnd_fwd_proc.terminate()
+            except Exception:
+                pass
+            self._wnd_fwd_proc = None
+
+    def _stop_wnd_bwd(self) -> None:
+        self._wnd_bwd_stop.set()
+        self._wnd_bwd_thread = None
+        if self._wnd_bwd_proc is not None:
+            try:
+                self._wnd_bwd_proc.stdout.close()
+                self._wnd_bwd_proc.terminate()
+            except Exception:
+                pass
+            self._wnd_bwd_proc = None
+
+    def _close_window(self) -> None:
+        self._stop_wnd_fwd()
+        self._stop_wnd_bwd()
+        self._wnd.clear()
+        self._use_window = False
+
+    def _on_scrub_seek_debounce(self) -> None:
+        val = self._scrubber.value()
+        if self._use_window and self._frame_cache is None:
+            self._wnd_anchor_at(val)
+        else:
+            self._prime_scrub_pipe(val)
+
     def _open_loop_pipe(self):
         """Pre-warm a pipe from frame 0 so the loop swap is instantaneous."""
         if self._loop_pipe_proc is not None or not self._path or not self._vid_w:
@@ -2670,6 +2855,13 @@ class PlayerWidget(QWidget):
             self._reverse_cache = []
         elif self._frame_cache is not None:
             self._pipe_frame = self._current_frame
+        elif self._use_window:
+            if not self._wnd or self._current_frame not in self._wnd:
+                self._wnd_anchor_at(self._current_frame)
+            elif not self._wnd_fwd_thread or not self._wnd_fwd_thread.is_alive():
+                max_f = max(self._wnd.keys()) if self._wnd else self._current_frame
+                if max_f + 1 < self._total_frames:
+                    self._start_wnd_fwd(max_f + 1)
         else:
             self._open_pipe(self._current_frame)
 
@@ -2800,6 +2992,48 @@ class PlayerWidget(QWidget):
                 self._render_raw(self._frame_cache[target_frame])
                 self._current_frame = target_frame
                 self._pipe_frame    = target_frame + 1
+
+            elif self._use_window:
+                # ── Sliding window mode ──────────────────────────── #
+                out  = self._effective_out()
+                in_f = self._effective_in()
+                if target_frame > out:
+                    out_reached = (self._out_frame is not None and
+                                   self._out_frame < self._mc_offset() + self._total_frames)
+                    raw_out = self._wnd.get(out)
+                    if raw_out:
+                        self._render_raw(raw_out)
+                    if self._loop and self._mc_idx < 0:
+                        self._current_frame    = in_f
+                        self._play_frame_start = in_f
+                        self._play_clock_start = time.monotonic()
+                        self._audio.play(in_f)
+                        self._scrubber.blockSignals(True)
+                        self._scrubber.setValue(in_f)
+                        self._scrubber.blockSignals(False)
+                        self._wnd_anchor_at(in_f)
+                        self._update_info()
+                    else:
+                        self._end_of_video(out_reached=out_reached)
+                    return
+                if target_frame <= self._current_frame:
+                    return
+                raw = self._wnd.get(target_frame)
+                if raw is not None:
+                    self._render_raw(raw)
+                    self._current_frame = target_frame
+                    # Evict frames that have fallen far behind the backward window
+                    evict_before = max(0, target_frame - self._wnd_bwd_size - 1)
+                    for f in [k for k in self._wnd if k < evict_before]:
+                        del self._wnd[f]
+                    # Restart forward fill if thread died before reaching end
+                    if (not self._wnd_fwd_thread or not self._wnd_fwd_thread.is_alive()):
+                        max_cached = max(self._wnd) if self._wnd else target_frame
+                        if max_cached + 1 < self._total_frames:
+                            self._start_wnd_fwd(max_cached + 1)
+                else:
+                    # Frame not yet decoded — re-anchor at the current target
+                    self._wnd_anchor_at(target_frame)
 
             else:
                 # ── Pipe mode ───────────────────────────────────────── #
@@ -2985,6 +3219,11 @@ class PlayerWidget(QWidget):
         if self._frame_cache and frame_num < len(self._frame_cache):
             self._render_raw(self._frame_cache[frame_num])
             return
+        if self._use_window:
+            raw = self._wnd.get(frame_num)
+            if raw:
+                self._render_raw(raw)
+                return
         raw = self._fetch_frame(frame_num)
         if raw:
             self._render_raw(raw)
@@ -3126,6 +3365,9 @@ class PlayerWidget(QWidget):
             elif self._frame_cache is not None:
                 self._pipe_frame = self._current_frame
                 self._close_scrub_pipe()
+            elif self._use_window:
+                self._close_scrub_pipe()
+                self._wnd_anchor_at(self._current_frame)
             elif (self._scrub_pipe_proc is not None
                     and self._scrub_pipe_frame == global_val):
                 # Adopt the pre-warmed scrub pipe — no ffmpeg startup wait
@@ -3152,6 +3394,8 @@ class PlayerWidget(QWidget):
             self._timer.start(max(1, int(1000 / (self._fps * self._speed))))
         else:
             self._close_scrub_pipe()
+            if self._use_window:
+                self._wnd_anchor_at(self._current_frame)
             self._show_frame(self._current_frame)
             self._update_info()
 
@@ -3212,15 +3456,24 @@ class PlayerWidget(QWidget):
         # Single-clip mode
         if self._frame_cache and value < len(self._frame_cache):
             self._render_raw(self._frame_cache[value])
+        elif self._use_window:
+            raw = self._wnd.get(value)
+            if raw is None:
+                raw = self._fetch_frame(value)
+                if raw:
+                    self._wnd[value] = raw
+            if raw:
+                self._render_raw(raw)
+            self._scrub_seek_debounce.start(120)
         else:
             raw = self._fetch_frame(value)
             if raw:
                 self._render_raw(raw)
+            if not self._play_reverse:
+                self._scrub_seek_debounce.start(120)
         self._current_frame = value
         self._update_info()
         self._audio.scrub(value)
-        if not self._play_reverse and not self._frame_cache:
-            self._scrub_seek_debounce.start(120)
 
     # ------------------------------------------------------------------ #
     #  Speed / loop                                                        #
@@ -3439,18 +3692,26 @@ class PlayerWidget(QWidget):
     def _rerender(self):
         """
         Re-fetch the current frame with updated -vf filters.
-        Cache, lookahead, and loop pipe are all invalidated — they were built
-        with the old filter chain.
+        Cache, lookahead, loop pipe, and window are all invalidated — they were
+        built with the old filter chain.
         """
         self._close_lookahead()
         self._close_loop_pipe()
         self._frame_cache   = None
         self._cache_loading = False
-        if self._is_playing and not self._play_reverse:
-            self._open_pipe(self._current_frame)
-        elif self._path and self._current_frame >= 0:
-            self._show_frame(self._current_frame)
-        self._start_cache_build()
+        if self._use_window:
+            self._stop_wnd_fwd()
+            self._stop_wnd_bwd()
+            self._wnd.clear()
+            self._wnd_anchor_at(self._current_frame)
+            if not self._is_playing:
+                self._show_frame(self._current_frame)
+        else:
+            if self._is_playing and not self._play_reverse:
+                self._open_pipe(self._current_frame)
+            elif self._path and self._current_frame >= 0:
+                self._show_frame(self._current_frame)
+            self._start_cache_build()
 
     # ------------------------------------------------------------------ #
     #  Keyboard                                                            #
@@ -3488,6 +3749,7 @@ class PlayerWidget(QWidget):
         self._close_loop_pipe()
         self._close_lookahead()
         self._close_scrub_pipe()
+        self._close_window()
         self._audio.stop()
         self._path             = ""
         self._current_frame    = 0
