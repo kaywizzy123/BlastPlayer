@@ -2345,7 +2345,7 @@ class PlayerWidget(QWidget):
         if self._annotations.is_dirty():
             result = _ann_save_dialog(self, "Save annotations for the current clip?")
             if result == 2:
-                self._annotations.save()
+                self._on_ann_save()
             elif result == 0:
                 return False
         self._cleanup()
@@ -4006,7 +4006,7 @@ class PlayerWidget(QWidget):
         w, h = self._effective_size()
         if not w or not h:
             return
-        self._canvas._ann_frame = self._current_frame
+        self._canvas._ann_frame = self._mc_offset() + self._current_frame
         if self._gpu_cache_ready:
             tex = self._canvas.get_cached_tex(self._current_frame)
             if tex is not None:
@@ -4283,18 +4283,22 @@ class PlayerWidget(QWidget):
             self._annotations.cancel_stroke()
             self._canvas.update()
 
+    def _ann_frame(self) -> int:
+        """Global annotation frame — unique across all clips in mc mode."""
+        return self._mc_offset() + self._current_frame
+
     def _on_ann_undo(self) -> None:
-        self._annotations.undo_stroke(self._current_frame)
+        self._annotations.undo_stroke(self._ann_frame())
         self._canvas.update()
         self._refresh_ann_markers()
 
     def _on_ann_redo(self) -> None:
-        self._annotations.redo_stroke(self._current_frame)
+        self._annotations.redo_stroke(self._ann_frame())
         self._canvas.update()
         self._refresh_ann_markers()
 
     def _on_ann_clear_frame(self) -> None:
-        self._annotations.clear_frame(self._current_frame)
+        self._annotations.clear_frame(self._ann_frame())
         self._canvas.update()
         self._refresh_ann_markers()
 
@@ -4307,18 +4311,52 @@ class PlayerWidget(QWidget):
         self._scrubber.set_annotation_frames(set(self._annotations.strokes.keys()))
 
     def _on_ann_copy(self) -> None:
-        self._annotations.copy_frame(self._current_frame)
+        self._annotations.copy_frame(self._ann_frame())
 
     def _on_ann_paste(self) -> None:
-        self._annotations.paste_frame(self._current_frame)
+        self._annotations.paste_frame(self._ann_frame())
         self._canvas.update()
         self._refresh_ann_markers()
 
     def _on_ann_save(self) -> None:
-        self._annotations.save()
+        if self._mc_idx >= 0 and self._mc_clips:
+            for clip in self._mc_clips:
+                clip_strokes = {}
+                for gf, strokes in self._annotations.strokes.items():
+                    lf = gf - clip['offset']
+                    if 0 <= lf < clip['total_frames']:
+                        clip_strokes[lf] = strokes
+                p = clip['path'] + '.annotations.json'
+                try:
+                    with open(p, 'w', encoding='utf-8') as fh:
+                        json.dump({str(k): v for k, v in clip_strokes.items()},
+                                  fh, separators=(',', ':'))
+                except Exception:
+                    pass
+            self._annotations._dirty = False
+        else:
+            self._annotations.save()
 
     def _on_ann_load_all(self) -> None:
-        self._annotations.discard()   # reloads from disk
+        ann = self._annotations
+        ann.strokes.clear()
+        ann._redo.clear()
+        ann._in_progress = None
+        ann._dirty = False
+        if self._mc_idx >= 0 and self._mc_clips:
+            for clip in self._mc_clips:
+                p = clip['path'] + '.annotations.json'
+                if not Path(p).exists():
+                    continue
+                try:
+                    with open(p, encoding='utf-8') as fh:
+                        data = json.load(fh)
+                    for k, v in data.items():
+                        ann.strokes[int(k) + clip['offset']] = v
+                except Exception:
+                    pass
+        else:
+            ann._load()
         self._refresh_ann_markers()
         self._canvas.update()
 
@@ -4457,8 +4495,8 @@ class PlayerWidget(QWidget):
         else:
             self._frames_lbl.setText(f"{self._total_frames} frames")
         self._fps_lbl.setText(f"{self._fps:.2f} fps")
-        # Sync annotation frame — called after _current_frame is finalized each tick
-        self._canvas._ann_frame = f
+        # Sync annotation frame — use global frame so mc clips don't share strokes
+        self._canvas._ann_frame = global_f
         if hasattr(self, '_on_frame_changed'):
             self._on_frame_changed(global_f + 1)
 
@@ -5475,7 +5513,7 @@ class BlastPlayerWindow(QMainWindow):
         if self._player._annotations.is_dirty():
             result = _ann_save_dialog(self, "Save annotations before closing?")
             if result == 2:
-                self._player._annotations.save()
+                self._player._on_ann_save()
             elif result == 0:
                 event.ignore()
                 return
