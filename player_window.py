@@ -1,18 +1,18 @@
-"""
+﻿"""
 BlastPlayer — player_window.py  (v4, FFmpeg backend)
 
 Layout
 ------
   BlastPlayerWindow
-  ├── menu bar
-  └── QStackedWidget
-      ├── WelcomeWidget
-      └── PlayerWidget
-          ├── VideoCanvas   (fills all space — pure black, video scaled to fit)
-          └── BottomBar     (dark strip)
-              ├── info row  "N frames"  |  FRAME#  |  fps
-              ├── scrubber  (full width)
-              └── transport row  [tools]  [nav]  [volume]
+  â"œ-- menu bar
+  â""-- QStackedWidget
+      â"œ-- WelcomeWidget
+      â""-- PlayerWidget
+          â"œ-- VideoCanvas   (fills all space — pure black, video scaled to fit)
+          â""-- BottomBar     (dark strip)
+              â"œ-- info row  "N frames"  |  FRAME#  |  fps
+              â"œ-- scrubber  (full width)
+              â""-- transport row  [tools]  [nav]  [volume]
 
 FFmpeg backend notes
 --------------------
@@ -32,14 +32,22 @@ import math
 import time
 import array
 import queue
+import base64
 import threading
 import subprocess
 import tempfile
 import ctypes
 from pathlib import Path
 
-from core.audio_engine import AudioEngine
-from core.session     import SessionServer, SessionClient
+from core.audio_engine     import AudioEngine
+from core.session          import SessionServer, SessionClient
+from core.annotation_layer import AnnotationLayer
+
+from ui.welcome_widget  import WelcomeWidget
+from ui.scrubber        import ScrubberSlider
+from ui.annotation_panel import AnnotationPanel, AnnotToolBtn
+
+from dialogs.ann_save_dialog import AnnSaveDialog
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QStackedWidget,
@@ -51,7 +59,7 @@ from PyQt5.QtWidgets import (
     QApplication, QLineEdit, QInputDialog, QProgressBar,
     QStyledItemDelegate, QAbstractItemView, QStyle, QSizeGrip, QDialog,
 )
-from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, QRect, QRectF, QPointF, QThread, pyqtSignal, QSettings, QObject
+from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, QRect, QRectF, QPointF, QThread, pyqtSignal, QSettings, QObject, QBuffer
 from PyQt5.QtGui import (
     QKeySequence, QPainter, QPen, QColor, QImage,
     QPixmap, QFont, QFontMetrics, QDragEnterEvent, QDropEvent, QIcon,
@@ -88,7 +96,7 @@ from core import constants
 from core.ocio_manager import OCIOManager, OCIO_AVAILABLE
 
 
-# ── helpers ───────────────────────────────────────────────────────────────── #
+# -- helpers ----------------------------------------------------------------- #
 
 def _icon(name: str) -> QIcon:
     p = constants.ICONS_DIR / name
@@ -142,7 +150,7 @@ def _ffplay_exe() -> str:
     return str(candidate) if candidate.exists() else exe
 
 
-# ── ffprobe metadata ──────────────────────────────────────────────────────── #
+# -- ffprobe metadata -------------------------------------------------------- #
 
 def probe_video(path: str) -> dict:
     """
@@ -202,9 +210,9 @@ def probe_video(path: str) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Playlist sidebar — helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 _THUMB_W = 80    # thumbnail width  (px)
 _THUMB_H = 45    # thumbnail height (px, ~16:9)
@@ -291,7 +299,7 @@ class _PlaylistDelegate(QStyledItemDelegate):
         playing  = (path == self._sb._current_playing)
         r        = option.rect
 
-        # ── Background ──────────────────────────────────────────────────
+        # -- Background --------------------------------------------------
         if selected:
             painter.fillRect(r, QColor(constants.ACCENT_HI))
         elif playing:
@@ -308,7 +316,7 @@ class _PlaylistDelegate(QStyledItemDelegate):
         painter.setPen(QPen(QColor(constants.BORDER)))
         painter.drawLine(r.bottomLeft(), r.bottomRight())
 
-        # ── Thumbnail ───────────────────────────────────────────────────
+        # -- Thumbnail ---------------------------------------------------
         tx = r.x() + 8
         ty = r.y() + (r.height() - _THUMB_H) // 2
         if thumb and not thumb.isNull():
@@ -321,7 +329,7 @@ class _PlaylistDelegate(QStyledItemDelegate):
             painter.setPen(QPen(QColor("#3c3c3c")))
             painter.drawRect(slot.adjusted(0, 0, -1, -1))
 
-        # ── Text block ──────────────────────────────────────────────────
+        # -- Text block --------------------------------------------------
         lx = tx + _THUMB_W + 8
         lw = r.right() - lx - 6
 
@@ -360,7 +368,7 @@ class _PlaylistDelegate(QStyledItemDelegate):
             painter.drawText(QRect(lx, r.y() + 27, lw, 14),
                              Qt.AlignLeft | Qt.AlignVCenter, el2)
 
-        # Row 3 — duration · frame count · fps  (bottom-aligned)
+        # Row 3 — duration Â· frame count Â· fps  (bottom-aligned)
         parts: list[str] = []
         if duration > 0:
             parts.append(_fmt_duration(duration))
@@ -368,16 +376,16 @@ class _PlaylistDelegate(QStyledItemDelegate):
             parts.append(f"{frames} fr")
         if fps:
             parts.append(f"{fps:.4g} fps")
-        info = "  ·  ".join(parts)
+        info = "  Â·  ".join(parts)
         painter.drawText(QRect(lx, r.bottom() - 20, lw, 16),
                          Qt.AlignLeft | Qt.AlignVCenter, info)
 
         painter.restore()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Playlist sidebar
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class PlaylistSidebar(QWidget):
     video_selected           = pyqtSignal(str)
@@ -392,58 +400,34 @@ class PlaylistSidebar(QWidget):
         self._paths:            list = []
         self._active_selection: list = []
         self._current_playing:  str  = ""
-        self._thumb_threads:    dict = {}   # path → _ThumbnailLoader
+        self._thumb_threads:    dict = {}   # path â†' _ThumbnailLoader
 
-        self._build_ui()
+        self.create_widgets()
+        self.create_layout()
+        self.create_connections()
 
-    # ── UI construction ──────────────────────────────────────────────────── #
+    # -- UI construction ---------------------------------------------------- #
 
-    def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
+    def create_widgets(self) -> None:
         # Header bar
-        hdr = QWidget()
-        hdr.setFixedHeight(34)
-        hdr.setStyleSheet(f"background:{constants.BORDER};")
-        hl = QHBoxLayout(hdr)
-        hl.setContentsMargins(10, 0, 4, 0)
-        hl.setSpacing(3)
-
-        title = QLabel("Playlist")
-        title.setStyleSheet(
-            f"color:{constants.TEXT_PRI};font-size:12px;"
-            f"font-weight:bold;background:transparent;")
-        hl.addWidget(title)
-        hl.addStretch()
+        self._hdr = QWidget()
+        self._hdr.setFixedHeight(34)
+        self._hdr.setStyleSheet(f"background:{constants.BORDER};")
+        self._hdr_layout = QHBoxLayout(self._hdr)
+        self._hdr_layout.setContentsMargins(10, 0, 4, 0)
+        self._hdr_layout.setSpacing(3)
 
         self._up_btn   = self._mk_hdr_btn("caret-arrow-up.png", "Move up")
         self._down_btn = self._mk_hdr_btn("down.png", "Move down")
-        self._up_btn.clicked.connect(self._move_up)
-        self._down_btn.clicked.connect(self._move_down)
-        hl.addWidget(self._up_btn)
-        hl.addWidget(self._down_btn)
-        hl.addSpacing(4)
-
-        clear_btn = QPushButton("Clear")
-        clear_btn.setFixedSize(40, 22)
-        clear_btn.setFocusPolicy(Qt.NoFocus)
-        clear_btn.setStyleSheet(f"""
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.setFixedSize(40, 22)
+        self._clear_btn.setFocusPolicy(Qt.NoFocus)
+        self._clear_btn.setStyleSheet(f"""
             QPushButton{{background:{constants.ACCENT};color:{constants.TEXT_SEC};
                 border:none;border-radius:3px;font-size:10px;}}
             QPushButton:hover{{background:{constants.ACCENT_HI};color:white;}}
         """)
-        clear_btn.clicked.connect(self.clear)
-        hl.addWidget(clear_btn)
-        self._hdr        = hdr
-        self._hdr_layout = hl
-        # NOTE: hdr is intentionally NOT added to root here.
-        # When hosted in a QDockWidget, the caller promotes _hdr to the dock's
-        # title bar via setTitleBarWidget so there is no phantom layout item.
-        # When used standalone, call show_header() to insert it.
 
-        # Search / filter bar
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search…")
         self._search.setClearButtonEnabled(True)
@@ -454,12 +438,9 @@ class PlaylistSidebar(QWidget):
                 font-size:11px;padding:0 8px;}}
             QLineEdit:focus{{border-bottom:1px solid {constants.ACCENT_HI};}}
         """)
-        self._search.textChanged.connect(self._apply_filter)
-        root.addWidget(self._search)
 
-        # Audio-loading indicator — thin indeterminate bar, hidden by default
         self._audio_bar = QProgressBar()
-        self._audio_bar.setRange(0, 0)          # indeterminate (pulsing)
+        self._audio_bar.setRange(0, 0)
         self._audio_bar.setFixedHeight(3)
         self._audio_bar.setTextVisible(False)
         self._audio_bar.setStyleSheet(f"""
@@ -467,9 +448,7 @@ class PlaylistSidebar(QWidget):
             QProgressBar::chunk{{background:{constants.ACCENT_HI};}}
         """)
         self._audio_bar.hide()
-        root.addWidget(self._audio_bar)
 
-        # Clip list
         self._list = QListWidget()
         self._list.setItemDelegate(_PlaylistDelegate(self, self._list))
         self._list.setStyleSheet(
@@ -486,11 +465,41 @@ class PlaylistSidebar(QWidget):
         self._list.setSelectionMode(QListWidget.ExtendedSelection)
         self._list.setDragDropMode(QListWidget.InternalMove)
         self._list.setDefaultDropAction(Qt.MoveAction)
-        self._list.model().rowsMoved.connect(self._sync_paths)
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
+
+    def create_layout(self) -> None:
+        # Header bar layout
+        hl = self._hdr_layout
+        title = QLabel("Playlist")
+        title.setStyleSheet(
+            f"color:{constants.TEXT_PRI};font-size:12px;"
+            f"font-weight:bold;background:transparent;")
+        hl.addWidget(title)
+        hl.addStretch()
+        hl.addWidget(self._up_btn)
+        hl.addWidget(self._down_btn)
+        hl.addSpacing(4)
+        hl.addWidget(self._clear_btn)
+        # NOTE: _hdr is intentionally NOT added to root here.
+        # When hosted in a QDockWidget, the caller promotes _hdr to the dock's
+        # title bar via setTitleBarWidget so there is no phantom layout item.
+        # When used standalone, call show_header() to insert it.
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._search)
+        root.addWidget(self._audio_bar)
+        root.addWidget(self._list, stretch=1)
+
+    def create_connections(self) -> None:
+        self._up_btn.clicked.connect(self._move_up)
+        self._down_btn.clicked.connect(self._move_down)
+        self._clear_btn.clicked.connect(self.clear)
+        self._search.textChanged.connect(self._apply_filter)
+        self._list.model().rowsMoved.connect(self._sync_paths)
         self._list.customContextMenuRequested.connect(self._show_context_menu)
         self._list.itemClicked.connect(self._on_item_clicked)
-        root.addWidget(self._list, stretch=1)
 
     def _mk_hdr_btn(self, icon_name: str, tip: str) -> QPushButton:
         btn = QPushButton()
@@ -505,7 +514,7 @@ class PlaylistSidebar(QWidget):
         """)
         return btn
 
-    # ── Public API ───────────────────────────────────────────────────────── #
+    # -- Public API --------------------------------------------------------- #
 
     def add_video(self, path: str) -> None:
         if path in self._paths:
@@ -622,7 +631,7 @@ class PlaylistSidebar(QWidget):
         else:
             self._audio_bar.hide()
 
-    # ── Drag-and-drop (OS → sidebar) ─────────────────────────────────────── #
+    # -- Drag-and-drop (OS â†' sidebar) --------------------------------------- #
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
@@ -636,7 +645,7 @@ class PlaylistSidebar(QWidget):
             if Path(p).suffix.lower() in constants.VIDEO_EXTS:
                 self.add_video(p)
 
-    # ── Thumbnail loading ─────────────────────────────────────────────────── #
+    # -- Thumbnail loading --------------------------------------------------- #
 
     def _start_thumb(self, path: str) -> None:
         if path in self._thumb_threads:
@@ -661,7 +670,7 @@ class PlaylistSidebar(QWidget):
             t.wait(300)
         self._thumb_threads.clear()
 
-    # ── List interaction ─────────────────────────────────────────────────── #
+    # -- List interaction --------------------------------------------------- #
 
     def _on_item_clicked(self, item) -> None:
         if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
@@ -742,7 +751,7 @@ class PlaylistSidebar(QWidget):
         item.setData(Qt.UserRole + 1, meta)
         self._list.viewport().update()
 
-    # ── Context menu ─────────────────────────────────────────────────────── #
+    # -- Context menu ------------------------------------------------------- #
 
     _MENU_STYLE = f"""
         QMenu{{background:{constants.BORDER};color:{constants.TEXT_PRI};
@@ -793,216 +802,9 @@ class PlaylistSidebar(QWidget):
             self.add_video(p)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Welcome screen
-# ══════════════════════════════════════════════════════════════════════════════
-
-class WelcomeWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet("background: black;")
-
-        logo = QLabel()
-        pix = QPixmap(str(constants.ICONS_DIR / "clapperboard.png"))
-        if not pix.isNull():
-            logo.setPixmap(pix.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            logo.setStyleSheet("background: transparent;")
-        else:
-            logo.setText("🎬")
-            logo.setStyleSheet("font-size: 52px; background: transparent;")
-        logo.setAlignment(Qt.AlignCenter)
-
-        title = QLabel("BlastPlayer")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(
-            f"font-size: 26px; font-weight: bold;"
-            f"color: {constants.TEXT_PRI}; background: transparent;"
-        )
-
-        hint = QLabel("Drop a video file here  ·  or  File → Open")
-        hint.setAlignment(Qt.AlignCenter)
-        hint.setStyleSheet(
-            f"font-size: 13px; color: {constants.TEXT_SEC}; background: transparent;"
-        )
-
-        layout = QVBoxLayout(self)
-        layout.addStretch(2)
-        layout.addWidget(logo)
-        layout.addSpacing(8)
-        layout.addWidget(title)
-        layout.addSpacing(12)
-        layout.addWidget(hint)
-        layout.addStretch(3)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Scrubber slider — clicks jump to exact position
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ScrubberSlider(QSlider):
-    """
-    QSlider that jumps to the exact clicked position on the groove.
-
-    Qt's default behaviour moves by a page step when clicking the groove, and
-    calling super() afterwards overrides our setValue with that page step.
-    We intercept groove clicks entirely: bypass super() for press/move/release,
-    manually emit the standard signals, and let super() handle handle-drag as
-    normal so no existing behaviour is regressed.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._groove_pressed = False
-        self._in_frame  = None   # int | None
-        self._out_frame = None   # int | None
-        self._mc_clips  = []     # list of clip dicts for multi-clip band painting
-        self._ann_frames: set = set()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            opt = QStyleOptionSlider()
-            self.initStyleOption(opt)
-            handle_rect = self.style().subControlRect(
-                QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
-            if not handle_rect.contains(event.pos()):
-                # Groove click: jump directly, don't let super() page-step on top.
-                self._groove_pressed = True
-                self.setValue(self._value_from_pos(event.pos()))
-                self.sliderPressed.emit()
-                event.accept()
-                return
-        self._groove_pressed = False
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._groove_pressed:
-            val = max(self.minimum(),
-                      min(self._value_from_pos(event.pos()), self.maximum()))
-            self.setValue(val)
-            self.sliderMoved.emit(val)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self._groove_pressed:
-            self._groove_pressed = False
-            self.sliderReleased.emit()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def _value_from_pos(self, pos) -> int:
-        opt = QStyleOptionSlider()
-        self.initStyleOption(opt)
-        groove = self.style().subControlRect(
-            QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
-        handle = self.style().subControlRect(
-            QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
-        if self.orientation() == Qt.Horizontal:
-            span    = groove.width() - handle.width()
-            rel_pos = pos.x() - groove.x() - handle.width() // 2
-        else:
-            span    = groove.height() - handle.height()
-            rel_pos = pos.y() - groove.y() - handle.height() // 2
-        return QStyle.sliderValueFromPosition(
-            self.minimum(), self.maximum(), rel_pos, span,
-            self.invertedAppearance())
-
-    def set_in_out(self, in_frame, out_frame):
-        self._in_frame  = in_frame
-        self._out_frame = out_frame
-        self.update()
-
-    def set_mc_clips(self, clips: list):
-        self._mc_clips = clips
-        self.update()
-
-    def set_annotation_frames(self, frames: set) -> None:
-        self._ann_frames = frames
-        self.update()
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if (self._in_frame is None and self._out_frame is None
-                and not self._mc_clips and not self._ann_frames):
-            return
-
-        opt    = QStyleOptionSlider()
-        self.initStyleOption(opt)
-        groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
-        handle = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
-        span   = groove.width() - handle.width()
-        offset = groove.x() + handle.width() // 2
-        gy     = groove.center().y()
-        gh     = groove.height()
-
-        def x_for(val):
-            return offset + QStyle.sliderPositionFromValue(
-                self.minimum(), self.maximum(), val, span)
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
-
-        # Multi-clip bands: alternate a light tint on odd-indexed clips
-        if len(self._mc_clips) > 1:
-            band_color = QColor(255, 255, 255, 70)
-            div_color  = QColor(255, 255, 255, 100)
-            bh = max(gh + 4, 8)   # band taller than the groove for visibility
-            clips = self._mc_clips
-            for i, clip in enumerate(clips):
-                x_start = x_for(clip['offset'])
-                # Extend band to the pixel just before the next clip starts so
-                # there is no single-frame gap between adjacent bands.
-                if i < len(clips) - 1:
-                    x_end = x_for(clips[i + 1]['offset'])
-                else:
-                    x_end = x_for(self.maximum()) + 1
-                if i % 2 == 1 and x_end > x_start:
-                    painter.fillRect(x_start, gy - bh // 2,
-                                     x_end - x_start, bh, band_color)
-                # Divider at each clip boundary except the first
-                if i > 0:
-                    painter.setPen(QPen(div_color, 1))
-                    painter.drawLine(x_start, gy - bh // 2, x_start, gy + bh // 2)
-
-        # Tinted range between in and out
-        x_in  = x_for(self._in_frame  if self._in_frame  is not None else self.minimum())
-        x_out = x_for(self._out_frame if self._out_frame is not None else self.maximum())
-        if self._in_frame is not None or self._out_frame is not None:
-            if x_out > x_in:
-                painter.fillRect(x_in, gy - 3, x_out - x_in, 6, QColor(255, 170, 0, 90))
-
-        # In-point marker (green)
-        if self._in_frame is not None:
-            painter.setPen(QPen(QColor("#4CAF50"), 2))
-            x = x_for(self._in_frame)
-            painter.drawLine(x, gy - 7, x, gy + 7)
-
-        # Out-point marker (orange-red)
-        if self._out_frame is not None:
-            painter.setPen(QPen(QColor("#FF6B35"), 2))
-            x = x_for(self._out_frame)
-            painter.drawLine(x, gy - 7, x, gy + 7)
-
-        # Annotation frame markers — scaled ticks, capped so adjacent frames stay distinct
-        if self._ann_frames:
-            total_frames = max(1, self.maximum() - self.minimum())
-            frame_px = span / total_frames
-            w = max(1, min(round(frame_px) - 1, 4))  # leave 1px gap; cap at 4px
-            ann_color = QColor("#FFD700")
-            for frame in self._ann_frames:
-                if self.minimum() <= frame <= self.maximum():
-                    cx = x_for(frame)
-                    painter.fillRect(cx - w // 2, gy - 5, w, 10, ann_color)
-
-        painter.end()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Video canvas
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class VideoCanvas(QOpenGLWidget):
     """
@@ -1058,7 +860,7 @@ void main() {
         self._frame_raw  = None   # bytes | None  — current SDR/HDR frame
         self._vid_w      = 0
         self._vid_h      = 0
-        self._is_hdr     = False  # True → rgb48le (GL_UNSIGNED_SHORT)
+        self._is_hdr     = False  # True â†' rgb48le (GL_UNSIGNED_SHORT)
         self._zoom       = 1.0
         self._pan_x      = 0
         self._pan_y      = 0
@@ -1072,12 +874,12 @@ void main() {
         self._tex_id     = None   # streaming texture for set_frame()
         self._tex_w      = 0
         self._tex_h      = 0
-        self._pbos       = None   # two PBOs for async CPU→GPU upload (set in initializeGL)
+        self._pbos       = None   # two PBOs for async CPUâ†'GPU upload (set in initializeGL)
         self._pbo_idx    = 0
 
         # GPU texture cache
         self._tex_pool      = []   # list[int] — pre-allocated texture IDs
-        self._tex_cache     = {}   # frame_num → tex_pool index
+        self._tex_cache     = {}   # frame_num â†' tex_pool index
         self._cache_w       = 0
         self._cache_h       = 0
         self._cache_is_hdr  = False
@@ -1091,10 +893,10 @@ void main() {
         # Annotation overlay
         self._ann_layer:   "AnnotationLayer | None" = None
         self._ann_frame:   int  = 0
-        self._ann_drawing: bool = False  # True → mouse captured for pen/eraser
-        self._ann_playing: bool = False  # True → currently in playback
+        self._ann_drawing: bool = False  # True â†' mouse captured for pen/eraser
+        self._ann_playing: bool = False  # True â†' currently in playback
 
-    # ── Public API ───────────────────────────────────────────────────── #
+    # -- Public API ----------------------------------------------------- #
 
     def set_frame(self, raw: bytes, vid_w: int, vid_h: int, is_hdr: bool = False):
         self._frame_raw = raw
@@ -1106,7 +908,7 @@ void main() {
         self.update()
 
     def set_cached_frame(self, tex_id: int):
-        """Render a previously cached texture (skips CPU→GPU upload)."""
+        """Render a previously cached texture (skips CPUâ†'GPU upload)."""
         self._draw_tex_id = tex_id
         self.update()
 
@@ -1121,7 +923,7 @@ void main() {
         self._pan_y = pan_y
         self.update()
 
-    # ── GPU Texture Cache API ─────────────────────────────────────────── #
+    # -- GPU Texture Cache API ------------------------------------------- #
 
     def begin_gpu_cache(self, n_frames: int, w: int, h: int, is_hdr: bool):
         """Pre-allocate *n_frames* textures for the GPU cache (main thread only)."""
@@ -1169,7 +971,7 @@ void main() {
         self._tex_cache   = {}
         self._draw_tex_id = None   # don't reference deleted textures
 
-    # ── OCIO API ─────────────────────────────────────────────────────── #
+    # -- OCIO API ------------------------------------------------------- #
 
     def set_ocio(self, func_src: str, lut_list: list):
         """
@@ -1219,7 +1021,7 @@ void main() {
         self._ocio_enabled  = False
         self._rebuild_shader()
 
-    # ── OpenGL callbacks ─────────────────────────────────────────────── #
+    # -- OpenGL callbacks ----------------------------------------------- #
 
     def initializeGL(self):
         self._vao = QOpenGLVertexArrayObject(self)
@@ -1232,7 +1034,7 @@ void main() {
         self._tex_id = int(glGenTextures(1))
         self._alloc_texture(self._tex_id, 0, 0, False)
 
-        # Two PBOs for async CPU→GPU texture upload (double-buffer orphaning)
+        # Two PBOs for async CPUâ†'GPU texture upload (double-buffer orphaning)
         self._pbos    = glGenBuffers(2)
         self._pbo_idx = 0
 
@@ -1251,7 +1053,7 @@ void main() {
         if self._prog is None:
             return
 
-        # ── Determine which texture to render ────────────────────────── #
+        # -- Determine which texture to render -------------------------- #
         if have_cached:
             render_tex = self._draw_tex_id
             # Keep _draw_tex_id set — subsequent repaints (e.g. scrubber update)
@@ -1288,7 +1090,7 @@ void main() {
                     if ptr is not None:
                         ctypes.memmove(ptr, self._frame_raw, data_size)
                         glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)
-                        # PBO bound → last arg is byte-offset, not a data pointer.
+                        # PBO bound â†' last arg is byte-offset, not a data pointer.
                         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
                                         GL_RGB, gl_type, ctypes.c_void_p(0))
                     else:
@@ -1318,12 +1120,12 @@ void main() {
 
         self._prog.bind()
 
-        # Frame texture → unit 0
+        # Frame texture â†' unit 0
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, render_tex)
         self._prog.setUniformValue("u_frame", 0)
 
-        # OCIO LUT textures → units 1, 2, …
+        # OCIO LUT textures â†' units 1, 2, …
         if self._ocio_enabled:
             for i, (sampler, tid, is_3d) in enumerate(self._ocio_lut_info):
                 unit = GL_TEXTURE1 + i
@@ -1334,7 +1136,7 @@ void main() {
                 if loc >= 0:
                     glUniform1i(loc, i + 1)
 
-        stride = 4 * 4          # 4 floats × 4 bytes
+        stride = 4 * 4          # 4 floats Ã— 4 bytes
         self._prog.enableAttributeArray(0)
         self._prog.enableAttributeArray(1)
         self._prog.setAttributeBuffer(0, GL_FLOAT, 0,     2, stride)
@@ -1350,7 +1152,7 @@ void main() {
         self._vbo.release()
         self._vao.release()
 
-    # ── Shader compilation ────────────────────────────────────────────── #
+    # -- Shader compilation ---------------------------------------------- #
 
     def _rebuild_shader(self):
         """Compile/relink the shader program with optional OCIO injection."""
@@ -1383,7 +1185,7 @@ void main() {
             return
         self._prog = prog
 
-    # ── Texture helpers ───────────────────────────────────────────────── #
+    # -- Texture helpers ------------------------------------------------- #
 
     @staticmethod
     def _alloc_texture(tid: int, w: int, h: int, is_hdr: bool):
@@ -1401,7 +1203,7 @@ void main() {
                              GL_RGB, GL_UNSIGNED_BYTE, None)
         glBindTexture(GL_TEXTURE_2D, 0)
 
-    # ── Quad geometry ────────────────────────────────────────────────── #
+    # -- Quad geometry -------------------------------------------------- #
 
     def _quad_vertices(self):
         vw, vh = self.width(), self.height()
@@ -1439,7 +1241,7 @@ void main() {
             x0, y0, u0, v1,
         ]
 
-    # ── Annotation API ───────────────────────────────────────────────── #
+    # -- Annotation API ------------------------------------------------- #
 
     def set_annotation_layer(self, layer: "AnnotationLayer") -> None:
         self._ann_layer = layer
@@ -1502,10 +1304,10 @@ void main() {
         v = v0 + (cy - rect.y()) / rh * (v1 - v0)
         return max(0.0, min(1.0, u)), max(0.0, min(1.0, v))
 
-    # ── paintEvent override (annotation overlay) ─────────────────────── #
+    # -- paintEvent override (annotation overlay) ----------------------- #
 
     def paintEvent(self, event):
-        super().paintEvent(event)   # runs paintGL → video on screen
+        super().paintEvent(event)   # runs paintGL â†' video on screen
         ann = self._ann_layer
         if ann is None or not ann.visible:
             return
@@ -1603,7 +1405,7 @@ void main() {
         painter.drawImage(0, 0, img)
         painter.end()
 
-    # ── Mouse / wheel ────────────────────────────────────────────────── #
+    # -- Mouse / wheel -------------------------------------------------- #
 
     def wheelEvent(self, event):
         self.zoom_scrolled.emit(1 if event.angleDelta().y() > 0 else -1)
@@ -1660,579 +1462,10 @@ void main() {
             super().mouseDoubleClickEvent(event)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Annotation data model
-# ══════════════════════════════════════════════════════════════════════════════
 
-class AnnotationLayer:
-    """Per-frame freehand strokes, persisted as a JSON sidecar next to the video."""
-
-    COLORS = ["#ff4444", "#ffdd00", "#ffffff", "#00ddff", "#44ff88"]
-    THICKNESSES = [2, 5, 12]
-
-    def __init__(self):
-        self.strokes:          dict = {}    # int → [stroke_dict, ...]
-        self._redo:            dict = {}    # int → [stroke_dict, ...] (transient)
-        self._in_progress:     dict | None = None
-        self.visible:          bool = True
-        self.show_in_playback: bool = True
-        self.active_tool:      str  = "pen"
-        self.pen_color:        str  = "#ff4444"
-        self._tool_thickness: dict = {
-            "pen": 5, "line": 3, "arrow": 3,
-            "rect": 3, "ellipse": 3, "eraser": 24,
-        }
-        self.ghost_enabled: bool = False
-        self._path:         str  = ""
-        self._dirty:        bool = False
-        self._clipboard:    list = []   # copied strokes (deep copy, frame-independent)
-
-    def begin_stroke(self, u: float, v: float) -> None:
-        t = self._tool_thickness.get(self.active_tool, 5)
-        self._in_progress = {
-            "tool": self.active_tool, "color": self.pen_color,
-            "thickness": t, "points": [(u, v)],
-        }
-
-    def get_thickness(self, tool: str) -> int:
-        return self._tool_thickness.get(tool, 5)
-
-    def set_thickness(self, tool: str, value: int) -> None:
-        self._tool_thickness[tool] = value
-
-    def extend_stroke(self, u: float, v: float) -> None:
-        if not self._in_progress:
-            return
-        tool = self._in_progress["tool"]
-        pts  = self._in_progress["points"]
-        if tool in ("pen", "eraser"):
-            pts.append((u, v))
-        else:
-            # Shape tools — keep only [start, current] so live preview is cheap
-            if len(pts) < 2:
-                pts.append((u, v))
-            else:
-                pts[1] = (u, v)
-
-    def end_stroke(self, frame: int) -> None:
-        s = self._in_progress
-        if s and s["points"]:
-            self.strokes.setdefault(frame, []).append(s)
-            self._redo.pop(frame, None)   # new stroke invalidates redo history
-            self._dirty = True
-        self._in_progress = None
-
-    def cancel_stroke(self) -> None:
-        self._in_progress = None
-
-    def live_stroke(self) -> dict | None:
-        return self._in_progress
-
-    def undo_stroke(self, frame: int) -> None:
-        strokes = self.strokes.get(frame)
-        if strokes:
-            self._redo.setdefault(frame, []).append(strokes.pop())
-            if not strokes:
-                self.strokes.pop(frame, None)
-            self._dirty = True
-
-    def redo_stroke(self, frame: int) -> None:
-        redo = self._redo.get(frame)
-        if redo:
-            self.strokes.setdefault(frame, []).append(redo.pop())
-            if not redo:
-                self._redo.pop(frame, None)
-            self._dirty = True
-
-    def clear_frame(self, frame: int) -> None:
-        self.strokes.pop(frame, None)
-        self._redo.pop(frame, None)
-        self._dirty = True
-
-    def clear_all(self) -> None:
-        self.strokes.clear()
-        self._redo.clear()
-        self._dirty = True
-
-    def copy_frame(self, frame: int) -> None:
-        import copy
-        self._clipboard = copy.deepcopy(self.strokes.get(frame, []))
-
-    def paste_frame(self, frame: int) -> None:
-        if not self._clipboard:
-            return
-        import copy
-        self.strokes[frame] = copy.deepcopy(self._clipboard)
-        self._redo.pop(frame, None)
-        self._dirty = True
-
-    def has_clipboard(self) -> bool:
-        return bool(self._clipboard)
-
-    def is_dirty(self) -> bool:
-        return self._dirty
-
-    def save(self) -> None:
-        self._save()
-        self._dirty = False
-
-    def discard(self) -> None:
-        """Reload from disk, throwing away all in-memory changes."""
-        self.strokes.clear()
-        self._redo.clear()
-        self._in_progress = None
-        if self._path:
-            self._load()
-        self._dirty = False
-
-    def set_video_path(self, path: str) -> None:
-        self.strokes.clear()
-        self._redo.clear()
-        self._in_progress = None
-        self._path = path
-        self._dirty = False
-
-    def _sidecar(self) -> str:
-        return (self._path + ".annotations.json") if self._path else ""
-
-    def _save(self) -> None:
-        p = self._sidecar()
-        if not p:
-            return
-        try:
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump({str(k): v for k, v in self.strokes.items()}, f,
-                          separators=(",", ":"))
-        except Exception:
-            pass
-
-    def _load(self) -> None:
-        p = self._sidecar()
-        if not p or not Path(p).exists():
-            return
-        try:
-            with open(p, encoding="utf-8") as f:
-                data = json.load(f)
-            self.strokes = {int(k): v for k, v in data.items()}
-        except Exception:
-            pass
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Annotation panel (dockable vertical sidebar)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class _AnnotToolBtn(QPushButton):
-    """Tool button that emits right_clicked on right mouse press."""
-    right_clicked = pyqtSignal()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.RightButton:
-            self.right_clicked.emit()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-
-class _AnnotationPanel(QWidget):
-    """Compact icon-only vertical annotation sidebar — hosted in a QDockWidget."""
-
-    changed         = pyqtSignal()
-    undo_req        = pyqtSignal()
-    redo_req        = pyqtSignal()
-    copy_req        = pyqtSignal()
-    paste_req       = pyqtSignal()
-    clear_frame_req = pyqtSignal()
-    clear_all_req   = pyqtSignal()
-
-    # (tool_name, icon_filename, tooltip)
-    _TOOLS = [
-        ("pen",     "pen.png",         "Freehand Pen"),
-        ("line",    "remove.png",      "Straight Line"),
-        ("arrow",   "right-arrow.png", "Arrow"),
-        ("ellipse", "rec.png",         "Ellipse"),
-        ("rect",    "stop.png",        "Rectangle"),
-        ("eraser",  "eraser.png",      "Eraser"),
-    ]
-
-    def __init__(self, ann: "AnnotationLayer", parent=None):
-        super().__init__(parent)
-        self._ann       = ann
-        self._tool_btns: dict[str, QPushButton] = {}
-        self._build_ui()
-
-    # ── Build ─────────────────────────────────────────────────────────── #
-
-    def _build_ui(self) -> None:
-        self.setStyleSheet(f"background:{constants.BORDER};")
-        root = QVBoxLayout(self)
-        root.setContentsMargins(3, 5, 3, 5)
-        root.setSpacing(3)
-
-        # ── Tool buttons (single column) ──────────────────────────────────
-        for tool, icon_file, tip in self._TOOLS:
-            btn = _AnnotToolBtn()
-            btn.setIcon(_icon(icon_file))
-            btn.setIconSize(QSize(14, 14))
-            btn.setCheckable(True)
-            btn.setChecked(tool == "pen")
-            btn.setFocusPolicy(Qt.NoFocus)
-            btn.setFixedHeight(26)
-            btn.setToolTip(f"{tip}  (right-click to set size)")
-            btn.setStyleSheet(self._tool_style(tool == "pen"))
-            btn.toggled.connect(lambda checked, t=tool, b=btn: self._on_tool_toggled(t, b, checked))
-            btn.right_clicked.connect(lambda t=tool, b=btn: self._show_size_popup(t, b))
-            self._tool_btns[tool] = btn
-            root.addWidget(btn)
-
-        root.addWidget(self._sep_h())
-
-        # ── Color swatch ──────────────────────────────────────────────────
-        self._color_btn = QPushButton()
-        self._color_btn.setFixedHeight(20)
-        self._color_btn.setFocusPolicy(Qt.NoFocus)
-        self._color_btn.setToolTip("Pen color — click to change")
-        self._color_btn.clicked.connect(self._pick_color)
-        root.addWidget(self._color_btn)
-        self._refresh_color_btn()
-
-        root.addWidget(self._sep_h())
-
-        # ── Action buttons (single column) ────────────────────────────────
-        for icon_file, tip, sig in (
-            ("undo.png",   "Undo last stroke",      self.undo_req),
-            ("redo.png",   "Redo last stroke",      self.redo_req),
-            ("copy.png",   "Copy frame annotations",  self.copy_req),
-            ("paste.png",  "Paste annotations here",  self.paste_req),
-            ("cancel.png", "Clear this frame",      self.clear_frame_req),
-            ("bin.png",    "Clear all frames",      self.clear_all_req),
-        ):
-            btn = QPushButton()
-            btn.setIcon(_icon(icon_file))
-            btn.setIconSize(QSize(14, 14))
-            btn.setFixedHeight(26)
-            btn.setFocusPolicy(Qt.NoFocus)
-            btn.setToolTip(tip)
-            btn.setStyleSheet(self._action_style())
-            btn.clicked.connect(sig)
-            root.addWidget(btn)
-
-        root.addWidget(self._sep_h())
-
-        # ── Visibility buttons (single column) ────────────────────────────
-        self._vis_btn = QPushButton()
-        self._vis_btn.setIcon(_icon("show.png"))
-        self._vis_btn.setIconSize(QSize(14, 14))
-        self._vis_btn.setCheckable(True)
-        self._vis_btn.setChecked(True)
-        self._vis_btn.setFixedHeight(26)
-        self._vis_btn.setFocusPolicy(Qt.NoFocus)
-        self._vis_btn.setToolTip("Show / Hide annotations")
-        self._vis_btn.setStyleSheet(self._toggle_style(True))
-        self._vis_btn.toggled.connect(self._on_vis_toggled)
-        root.addWidget(self._vis_btn)
-
-        self._pb_btn = QPushButton()
-        self._pb_btn.setIcon(_icon("forward.png"))
-        self._pb_btn.setIconSize(QSize(14, 14))
-        self._pb_btn.setCheckable(True)
-        self._pb_btn.setChecked(True)
-        self._pb_btn.setFixedHeight(26)
-        self._pb_btn.setFocusPolicy(Qt.NoFocus)
-        self._pb_btn.setToolTip("Show annotations during playback")
-        self._pb_btn.setStyleSheet(self._toggle_style(True))
-        self._pb_btn.toggled.connect(self._on_pb_toggled)
-        root.addWidget(self._pb_btn)
-
-        self._ghost_btn = QPushButton()
-        self._ghost_btn.setIcon(_icon("ghost.png"))
-        self._ghost_btn.setIconSize(QSize(14, 14))
-        self._ghost_btn.setCheckable(True)
-        self._ghost_btn.setChecked(False)
-        self._ghost_btn.setFixedHeight(26)
-        self._ghost_btn.setFocusPolicy(Qt.NoFocus)
-        self._ghost_btn.setToolTip("Ghost  (right-click to set frame range)")
-        self._ghost_btn.setStyleSheet(self._toggle_style(False))
-        self._ghost_btn.toggled.connect(self._on_ghost_toggled)
-        root.addWidget(self._ghost_btn)
-
-        root.addStretch()
-
-    # ── Styling helpers ───────────────────────────────────────────────── #
-
-    @staticmethod
-    def _icon_font() -> QFont:
-        f = QFont()
-        f.setPointSize(14)
-        return f
-
-    @staticmethod
-    def _tool_style(active: bool) -> str:
-        bg     = "#4a4a6a" if active else "#2a2a2a"
-        border = f"2px solid {constants.ACCENT_HI}" if active else "2px solid #3a3a3a"
-        return (
-            f"QPushButton{{background:{bg};color:{constants.TEXT_PRI};"
-            f"border:{border};border-radius:6px;font-size:16px;}}"
-            f"QPushButton:hover{{background:#3a3a5a;border:2px solid {constants.ACCENT_HI};}}"
-            f"QPushButton:checked{{background:#4a4a6a;border:2px solid {constants.ACCENT_HI};}}"
-        )
-
-    @staticmethod
-    def _action_style() -> str:
-        return (
-            f"QPushButton{{background:#2a2a2a;color:{constants.TEXT_SEC};"
-            f"border:2px solid #3a3a3a;border-radius:6px;font-size:14px;}}"
-            f"QPushButton:hover{{background:#3a3a3a;color:{constants.TEXT_PRI};"
-            f"border:2px solid #555;}}"
-        )
-
-    @staticmethod
-    def _toggle_style(active: bool) -> str:
-        bg     = "#2a4a2a" if active else "#2a2a2a"
-        border = "2px solid #4a8a4a" if active else "2px solid #3a3a3a"
-        return (
-            f"QPushButton{{background:{bg};color:{constants.TEXT_PRI};"
-            f"border:{border};border-radius:6px;font-size:14px;}}"
-            f"QPushButton:hover{{background:#3a5a3a;border:2px solid #5aaa5a;}}"
-            f"QPushButton:checked{{background:#2a4a2a;border:2px solid #4a8a4a;}}"
-        )
-
-    @staticmethod
-    def _sep_h() -> QFrame:
-        f = QFrame()
-        f.setFrameShape(QFrame.HLine)
-        f.setFixedHeight(1)
-        f.setStyleSheet("background:#333;border:none;")
-        return f
-
-    @staticmethod
-    def _slider_style() -> str:
-        return (
-            f"QSlider::groove:horizontal{{background:#333;height:4px;border-radius:2px;}}"
-            f"QSlider::handle:horizontal{{background:{constants.TEXT_PRI};"
-            f"width:10px;height:10px;border-radius:0px;margin:-3px 0;}}"
-            f"QSlider::handle:horizontal:hover{{background:{constants.ACCENT_HI};}}"
-            f"QSlider::sub-page:horizontal{{background:{constants.ACCENT_HI};border-radius:2px;}}"
-        )
-
-    # ── Color ─────────────────────────────────────────────────────────── #
-
-    def _refresh_color_btn(self) -> None:
-        c = self._ann.pen_color
-        self._color_btn.setStyleSheet(
-            f"QPushButton{{background:{c};border:2px solid #555;border-radius:6px;}}"
-            f"QPushButton:hover{{border:2px solid {constants.TEXT_PRI};}}"
-        )
-
-    def _pick_color(self) -> None:
-        dlg = QColorDialog(QColor(self._ann.pen_color), self)
-        dlg.setWindowTitle("Pen Color")
-        dlg.setOptions(QColorDialog.DontUseNativeDialog)
-        dlg.setStyleSheet(f"""
-            QColorDialog, QColorDialog > QWidget {{
-                background: #1c1c1c; color: {constants.TEXT_PRI};
-            }}
-            QLabel {{
-                color: {constants.TEXT_PRI}; background: transparent;
-            }}
-            QPushButton {{
-                background: #2a2a2a; color: {constants.TEXT_PRI};
-                border: 1px solid #3a3a3a; border-radius: 4px;
-                padding: 4px 14px; min-width: 64px;
-            }}
-            QPushButton:hover {{ background: #363636; border-color: #555; }}
-            QLineEdit, QSpinBox {{
-                background: #2a2a2a; color: {constants.TEXT_PRI};
-                border: 1px solid #3a3a3a; border-radius: 3px; padding: 2px 4px;
-            }}
-            QSpinBox::up-button, QSpinBox::down-button {{
-                background: #333; border: none; width: 14px;
-            }}
-            QSpinBox::up-arrow {{ border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-bottom: 5px solid {constants.TEXT_SEC}; }}
-            QSpinBox::down-arrow {{ border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid {constants.TEXT_SEC}; }}
-            QAbstractItemView {{
-                background: #1c1c1c; color: {constants.TEXT_PRI};
-                selection-background-color: {constants.ACCENT_HI};
-            }}
-        """)
-        _ok_style = (
-            f"QPushButton{{background:{constants.ACCENT_HI};color:{constants.TEXT_PRI};"
-            f"border:1px solid {constants.ACCENT_HI};border-radius:4px;"
-            f"padding:4px 14px;min-width:64px;}}"
-            f"QPushButton:hover{{background:#1a9cf0;border-color:#1a9cf0;}}"
-        )
-        _cancel_style = (
-            f"QPushButton{{background:#2a2a2a;color:{constants.TEXT_PRI};"
-            f"border:1px solid #3a3a3a;border-radius:4px;"
-            f"padding:4px 14px;min-width:64px;}}"
-            f"QPushButton:hover{{background:#363636;border-color:#555;}}"
-        )
-        for btn in dlg.findChildren(QPushButton):
-            txt = btn.text().replace("&", "")
-            if txt == "OK":
-                btn.setStyleSheet(_ok_style)
-            elif txt == "Cancel":
-                btn.setStyleSheet(_cancel_style)
-        if dlg.exec_() == QDialog.Accepted:
-            color = dlg.selectedColor()
-            if color.isValid():
-                self._ann.pen_color = color.name()
-                self._refresh_color_btn()
-                if self._ann.active_tool not in ("pen", "line", "arrow", "rect", "ellipse"):
-                    self._tool_btns["pen"].setChecked(True)
-            self.changed.emit()
-
-    # ── Tool toggle ───────────────────────────────────────────────────── #
-
-    def _on_tool_toggled(self, tool: str, btn: QPushButton, checked: bool) -> None:
-        if checked:
-            self._ann.active_tool = tool
-            btn.setStyleSheet(self._tool_style(True))
-            # Uncheck all others
-            for t, b in self._tool_btns.items():
-                if t != tool and b.isChecked():
-                    b.blockSignals(True)
-                    b.setChecked(False)
-                    b.setStyleSheet(self._tool_style(False))
-                    b.blockSignals(False)
-        else:
-            # Don't allow deselecting unless another tool is checked
-            any_checked = any(b.isChecked() for b in self._tool_btns.values())
-            if not any_checked:
-                btn.blockSignals(True)
-                btn.setChecked(True)
-                btn.blockSignals(False)
-            btn.setStyleSheet(self._tool_style(btn.isChecked()))
-
-    # ── Size popup (right-click on any tool button) ───────────────────── #
-
-    def _show_size_popup(self, tool: str, btn: _AnnotToolBtn) -> None:
-        lo, hi = (4, 100) if tool == "eraser" else (1, 50)
-        current = self._ann.get_thickness(tool)
-
-        # Use self as parent so Qt owns the lifetime; also store on self so
-        # Python's reference count never drops to zero before it's shown.
-        popup = QWidget(self, Qt.Popup | Qt.FramelessWindowHint)
-        self._size_popup = popup
-        popup.setStyleSheet(
-            f"QWidget{{background:#232323;border:none;border-radius:6px;}}"
-            f"QLabel{{color:{constants.TEXT_PRI};font-size:10px;"
-            f"background:transparent;border:none;}}")
-
-        layout = QVBoxLayout(popup)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(2)
-
-        lbl = QLabel(f"Size: {current}")
-        lbl.setAlignment(Qt.AlignCenter)
-        layout.addWidget(lbl)
-
-        slider = QSlider(Qt.Horizontal)
-        slider.setRange(lo, hi)
-        slider.setValue(current)
-        slider.setFixedWidth(150)
-        slider.setFocusPolicy(Qt.StrongFocus)
-        slider.setStyleSheet(self._slider_style())
-        layout.addWidget(slider)
-
-        def _on_change(v: int) -> None:
-            self._ann.set_thickness(tool, v)
-            lbl.setText(f"Size: {v}")
-            self.changed.emit()
-
-        slider.valueChanged.connect(_on_change)
-
-        popup.adjustSize()
-        pw = popup.width()
-        ph = popup.height()
-        # Prefer left of the button (panel is on the right edge of the window)
-        btn_global = btn.mapToGlobal(QPoint(0, 0))
-        x = btn_global.x() - pw - 4
-        y = btn_global.y()
-        # Clamp to screen so it never falls off any edge
-        screen = btn.screen().availableGeometry() if hasattr(btn, 'screen') else \
-                 QApplication.primaryScreen().availableGeometry()
-        x = max(screen.left(), min(x, screen.right()  - pw))
-        y = max(screen.top(),  min(y, screen.bottom() - ph))
-        popup.move(x, y)
-        popup.show()
-        slider.setFocus()
-
-    # ── Visibility slots ──────────────────────────────────────────────── #
-
-    def _on_vis_toggled(self, checked: bool) -> None:
-        self._ann.visible = checked
-        self._vis_btn.setIcon(_icon("show.png" if checked else "hidden.png"))
-        self._vis_btn.setStyleSheet(self._toggle_style(checked))
-        self.changed.emit()
-
-    def _on_pb_toggled(self, checked: bool) -> None:
-        self._ann.show_in_playback = checked
-        self._pb_btn.setStyleSheet(self._toggle_style(checked))
-        self.changed.emit()
-
-    def _on_ghost_toggled(self, checked: bool) -> None:
-        self._ann.ghost_enabled = checked
-        self._ghost_btn.setStyleSheet(self._toggle_style(checked))
-        self.changed.emit()
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _ann_save_dialog(parent, message: str) -> int:
-    """
-    Dark-themed Save / Discard / Cancel dialog for annotation changes.
-    Returns 2 = Save, 1 = Discard, 0 = Cancel.
-    """
-    dlg = QDialog(parent, Qt.Dialog)
-    dlg.setWindowTitle("Unsaved Annotations")
-    dlg.setModal(True)
-    dlg.setStyleSheet(
-        f"QDialog{{background:#1c1c1c;color:{constants.TEXT_PRI};}}"
-        f"QLabel{{color:{constants.TEXT_PRI};background:transparent;"
-        f"font-size:13px;padding:0;}}"
-        f"QPushButton{{background:#2a2a2a;color:{constants.TEXT_PRI};"
-        f"border:1px solid #3a3a3a;border-radius:4px;"
-        f"padding:5px 18px;font-size:12px;min-width:72px;}}"
-        f"QPushButton:hover{{background:#363636;border-color:#555;}}"
-        f"QPushButton#save_btn{{background:{constants.ACCENT_HI};"
-        f"border-color:{constants.ACCENT_HI};}}"
-        f"QPushButton#save_btn:hover{{background:#1a9cf0;"
-        f"border-color:#1a9cf0;}}"
-    )
-    root = QVBoxLayout(dlg)
-    root.setContentsMargins(24, 20, 24, 16)
-    root.setSpacing(18)
-    lbl = QLabel(message)
-    lbl.setWordWrap(True)
-    root.addWidget(lbl)
-    btn_row = QHBoxLayout()
-    btn_row.setSpacing(8)
-    btn_row.addStretch()
-    cancel_btn  = QPushButton("Cancel")
-    discard_btn = QPushButton("Discard")
-    save_btn    = QPushButton("Save")
-    save_btn.setObjectName("save_btn")
-    save_btn.setDefault(True)
-    for b in (cancel_btn, discard_btn, save_btn):
-        btn_row.addWidget(b)
-    root.addLayout(btn_row)
-    cancel_btn.clicked.connect(lambda: dlg.done(0))
-    discard_btn.clicked.connect(lambda: dlg.done(1))
-    save_btn.clicked.connect(lambda: dlg.done(2))
-    return dlg.exec_()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Player widget
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class PlayerWidget(QWidget):
     """
@@ -2250,11 +1483,11 @@ class PlayerWidget(QWidget):
                       for frame-accurate positioning.
 
     Shortcuts:  Space/K  play-pause   L  play-fwd   J  play-bwd
-                ←/→  step frame       Home/End  first/last
+                â†/â†'  step frame       Home/End  first/last
     """
 
     _SPEEDS             = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
-    _SPEED_LABELS       = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
+    _SPEED_LABELS       = ("0.25Ã—", "0.5Ã—", "0.75Ã—", "1Ã—", "1.25Ã—", "1.5Ã—", "1.75Ã—", "2Ã—")
     _CACHE_MAX_MB        = 2048   # skip CPU RAM cache if decoded frames exceed this
     _PREFETCH_QUEUE_SIZE = 64     # frames buffered ahead in the pipe reader thread
     _WINDOW_BUDGET_MB    = 4096   # sliding-window RAM budget for large-video playback
@@ -2316,7 +1549,7 @@ class PlayerWidget(QWidget):
 
         # Sliding window cache (Tier-2: large videos that exceed _CACHE_MAX_MB)
         self._use_window      = False
-        self._wnd: dict       = {}          # frame_number → raw_bytes
+        self._wnd: dict       = {}          # frame_number â†' raw_bytes
         self._wnd_fwd_size    = 0           # frames to keep ahead of playhead
         self._wnd_bwd_size    = 0           # frames to keep behind playhead
         self._wnd_fwd_proc    = None
@@ -2330,7 +1563,7 @@ class PlayerWidget(QWidget):
         self._frame_cache   = None   # list[bytes] once ready, None while not cached
         self._cache_loading = False  # True while background decode is running
         # Per-clip cache for multi-clip mode (keyed by path)
-        self._mc_caches: dict = {}   # path → list[bytes]
+        self._mc_caches: dict = {}   # path â†' list[bytes]
 
         # GPU texture cache — frames uploaded to VideoCanvas texture pool
         self._gpu_cache_ready   = False
@@ -2386,15 +1619,18 @@ class PlayerWidget(QWidget):
 
         # Annotation state
         self._annotations = AnnotationLayer()
-        self._ann_panel   = _AnnotationPanel(self._annotations)
+        self._ann_panel   = AnnotationPanel(self._annotations)
 
         # Session sync
         self._session_server:    SessionServer | None = None
         self._session_client:    SessionClient | None = None
-        self._session_follower:  bool = False   # True → we receive, not broadcast
+        self._session_follower:  bool = False   # True â†' we receive, not broadcast
         self._session_applying:  bool = False   # guard against re-broadcast loops
+        self._session_stream_mode: bool = False  # True â†' no local file; display host frames
 
-        self._build_ui()
+        self.create_widgets()
+        self.create_layout()
+        self.create_connections()
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
@@ -2402,7 +1638,7 @@ class PlayerWidget(QWidget):
 
     def load_video(self, path: str) -> bool:
         if self._annotations.is_dirty():
-            result = _ann_save_dialog(self, "Save annotations for the current clip?")
+            result = AnnSaveDialog.ask("Save annotations for the current clip?", self)
             if result == 2:
                 self._on_ann_save()
             elif result == 0:
@@ -2462,6 +1698,16 @@ class PlayerWidget(QWidget):
 
         if self._autoplay:
             self._play()
+
+        # Inform followers about the newly loaded video
+        if not self._session_applying:
+            self._session_broadcast({
+                "type": "load",
+                "path": path,
+                "fps": self._fps,
+                "total_frames": self._total_frames,
+            })
+
         return True
 
     def stop(self):
@@ -2477,7 +1723,7 @@ class PlayerWidget(QWidget):
 
     @staticmethod
     def _exr_seq_pattern(path: str) -> str:
-        """Convert frame_0001.exr → frame_%04d.exr for ffmpeg -i."""
+        """Convert frame_0001.exr â†' frame_%04d.exr for ffmpeg -i."""
         m = re.search(r'(\d+)(\.[^.]+)$', path)
         if m:
             return path[:m.start(1)] + f"%0{len(m.group(1))}d" + m.group(2)
@@ -2804,7 +2050,7 @@ class PlayerWidget(QWidget):
             print(f"[BlastPlayer] fetch_frame: {exc}")
             return None
 
-    # ── Pipe (forward playback) ──────────────────────────────────────── #
+    # -- Pipe (forward playback) ---------------------------------------- #
 
     _LOOKAHEAD_FRAMES    = 30    # open the loop-back pipe this many frames before the end
     _AUDIO_SYNC_OFFSET   = 0.10  # seconds — shifts video clock forward to wait for ffplay startup
@@ -2873,7 +2119,7 @@ class PlayerWidget(QWidget):
     def _close_lookahead(self):
         self._loop_frame0 = None
 
-    # ── RAM frame cache ──────────────────────────────────────────────── #
+    # -- RAM frame cache ------------------------------------------------ #
 
     def _start_cache_build(self):
         """
@@ -2983,7 +2229,7 @@ class PlayerWidget(QWidget):
 
             threading.Thread(target=_fill, daemon=True).start()
 
-    # ── Sliding window cache ─────────────────────────────────────────────── #
+    # -- Sliding window cache ----------------------------------------------- #
 
     def _wnd_compute_sizes(self) -> None:
         budget      = self._WINDOW_BUDGET_MB * 1_048_576
@@ -3232,7 +2478,7 @@ class PlayerWidget(QWidget):
                 break
             q.put(bytes(raw))   # blocks if queue full — fine for background thread
 
-    # ── Reverse frame cache ──────────────────────────────────────────── #
+    # -- Reverse frame cache -------------------------------------------- #
 
     _REVERSE_BATCH = 60   # frames decoded per cache fill
 
@@ -3420,7 +2666,10 @@ class PlayerWidget(QWidget):
     #  UI                                                                  #
     # ------------------------------------------------------------------ #
 
-    def _build_ui(self):
+    def create_widgets(self):
+        pass
+
+    def create_layout(self):
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -3435,18 +2684,20 @@ class PlayerWidget(QWidget):
         self._ann_panel.setVisible(False)
         outer.addWidget(self._ann_panel)
 
-        # ── Content row: video canvas ─────────────────────────────────────
+        # -- Content row: video canvas -------------------------------------
         self._canvas = VideoCanvas()
-        self._canvas.zoom_scrolled.connect(self._on_zoom_scroll)
-        self._canvas.pan_dragged.connect(self._on_pan_drag)
-        self._canvas.stroke_committed.connect(self._refresh_ann_markers)
-        self._canvas.stroke_committed.connect(self._on_stroke_committed_broadcast)
 
         root.addWidget(self._canvas, stretch=1)
 
         self._canvas.set_annotation_layer(self._annotations)
 
-        # ── Timeline strip ────────────────────────────────────────────────
+        # Overlay for streaming mode — covers canvas when follower has no local file
+        self._stream_overlay = QLabel(self._canvas)
+        self._stream_overlay.setAlignment(Qt.AlignCenter)
+        self._stream_overlay.setStyleSheet("background:#000000;")
+        self._stream_overlay.hide()
+
+        # -- Timeline strip ------------------------------------------------
         timeline = QWidget()
         self._timeline_widget = timeline
         timeline.setFixedHeight(64)
@@ -3484,9 +2735,6 @@ class PlayerWidget(QWidget):
         self._scrubber.setRange(0, 0)
         self._scrubber.setFocusPolicy(Qt.NoFocus)
         self._scrubber.setStyleSheet(self._playback_scrubber_style())
-        self._scrubber.sliderPressed.connect(self._on_scrubber_pressed)
-        self._scrubber.sliderReleased.connect(self._on_scrubber_released)
-        self._scrubber.sliderMoved.connect(self._on_scrubber_moved)
         sc_row.addWidget(self._scrubber, stretch=1)
 
         self._fps_lbl = QLabel("24.00 fps")
@@ -3499,7 +2747,7 @@ class PlayerWidget(QWidget):
 
         root.addWidget(timeline)
 
-        # ── Transport row ─────────────────────────────────────────────────
+        # -- Transport row -------------------------------------------------
         transport = QWidget()
         self._transport_widget = transport
         transport.setFixedHeight(40)
@@ -3515,13 +2763,12 @@ class PlayerWidget(QWidget):
             self._playlist_btn.setIcon(ic)
             self._playlist_btn.setIconSize(QSize(14, 14))
         else:
-            self._playlist_btn.setText("≡")
+            self._playlist_btn.setText("â‰¡")
         self._playlist_btn.setCheckable(True)
         self._playlist_btn.setFixedSize(28, 28)
         self._playlist_btn.setFocusPolicy(Qt.NoFocus)
         self._playlist_btn.setToolTip("Show / Hide Playlist")
         self._playlist_btn.setStyleSheet(self._loop_style(False))
-        self._playlist_btn.toggled.connect(self._toggle_playlist)
         tr.addWidget(self._playlist_btn)
 
         self._ann_btn = QPushButton()
@@ -3530,23 +2777,22 @@ class PlayerWidget(QWidget):
             self._ann_btn.setIcon(ic_ann)
             self._ann_btn.setIconSize(QSize(14, 14))
         else:
-            self._ann_btn.setText("✏")
+            self._ann_btn.setText("âœ")
         self._ann_btn.setCheckable(True)
         self._ann_btn.setFixedSize(28, 28)
         self._ann_btn.setFocusPolicy(Qt.NoFocus)
         self._ann_btn.setToolTip("Annotations  (Ctrl+Shift+A)")
         self._ann_btn.setStyleSheet(self._loop_style(False))
-        self._ann_btn.toggled.connect(self._toggle_annotation_toolbar)
         tr.addWidget(self._ann_btn)
         tr.addSpacing(6)
 
         tr.addStretch(1)
 
         self._first_btn = _nav_btn("", "backward.png",              tooltip="First frame  (Home)", w=28, h=28)
-        self._prev_btn  = _nav_btn("", "left-arrow.png",            tooltip="Step back  (←)",      w=28, h=28)
+        self._prev_btn  = _nav_btn("", "left-arrow.png",            tooltip="Step back  (â†)",      w=28, h=28)
         self._back_btn  = _nav_btn("", "left.png",                  tooltip="Play backward  (J)",  w=28, h=28)
         self._play_btn  = _nav_btn("", "play-button-arrowhead.png", tooltip="Play / Pause  (Space)", w=42, h=32)
-        self._next_btn  = _nav_btn("", "right-arrow (2).png",       tooltip="Step forward  (→)",   w=28, h=28)
+        self._next_btn  = _nav_btn("", "right-arrow (2).png",       tooltip="Step forward  (â†')",   w=28, h=28)
         self._last_btn  = _nav_btn("", "skip-button.png",           tooltip="Last frame  (End)",   w=28, h=28)
 
         self._loop_btn = QPushButton()
@@ -3557,7 +2803,6 @@ class PlayerWidget(QWidget):
         self._loop_btn.setFocusPolicy(Qt.NoFocus)
         self._loop_btn.setToolTip("Loop")
         self._loop_btn.setStyleSheet(self._loop_style(False))
-        self._loop_btn.toggled.connect(self._on_loop_toggled)
 
         self._play_btn.setStyleSheet(f"""
             QPushButton {{
@@ -3607,11 +2852,9 @@ class PlayerWidget(QWidget):
             }}
             QComboBox::drop-down {{ border: none; width: 0px; }}
         """)
-        self._speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         right_layout.addWidget(self._speed_combo)
 
         self._vol_btn = _nav_btn("", "volume-up.png", tooltip="Mute / Unmute", w=24, h=28)
-        self._vol_btn.clicked.connect(self._toggle_mute)
         right_layout.addWidget(self._vol_btn)
 
         self._vol_slider = QSlider(Qt.Horizontal)
@@ -3621,7 +2864,6 @@ class PlayerWidget(QWidget):
         self._vol_slider.setFocusPolicy(Qt.NoFocus)
         self._vol_slider.setToolTip("Volume")
         self._vol_slider.setStyleSheet(self._scrubber_style())
-        self._vol_slider.valueChanged.connect(self._on_volume_changed)
         right_layout.addWidget(self._vol_slider)
 
         self._vol_lbl = QLabel(f"{self._volume}%")
@@ -3644,13 +2886,28 @@ class PlayerWidget(QWidget):
         tr.addWidget(right, stretch=1)
         root.addWidget(transport)
 
-        # Wire buttons
+
+    def create_connections(self):
+        self._canvas.zoom_scrolled.connect(self._on_zoom_scroll)
+        self._canvas.pan_dragged.connect(self._on_pan_drag)
+        self._canvas.stroke_committed.connect(self._refresh_ann_markers)
+        self._canvas.stroke_committed.connect(self._on_stroke_committed_broadcast)
+        self._scrubber.sliderPressed.connect(self._on_scrubber_pressed)
+        self._scrubber.sliderReleased.connect(self._on_scrubber_released)
+        self._scrubber.sliderMoved.connect(self._on_scrubber_moved)
+        self._playlist_btn.toggled.connect(self._toggle_playlist)
+        self._ann_btn.toggled.connect(self._toggle_annotation_toolbar)
+        self._loop_btn.toggled.connect(self._on_loop_toggled)
+        self._speed_combo.currentIndexChanged.connect(self._on_speed_changed)
+        self._vol_btn.clicked.connect(self._toggle_mute)
+        self._vol_slider.valueChanged.connect(self._on_volume_changed)
         self._first_btn.clicked.connect(self._go_first)
         self._prev_btn.clicked.connect(self._step_back)
         self._back_btn.clicked.connect(self._play_backward)
         self._play_btn.clicked.connect(self._toggle_play)
         self._next_btn.clicked.connect(self._step_forward)
         self._last_btn.clicked.connect(self._go_last)
+
 
     # ------------------------------------------------------------------ #
     #  Playback core                                                       #
@@ -3745,7 +3002,7 @@ class PlayerWidget(QWidget):
             return
 
         if self._play_reverse:
-            # ── Reverse ───────────────────────────────────────────────── #
+            # -- Reverse ------------------------------------------------- #
             if self._frame_cache is not None:
                 # Fast path: serve directly from RAM cache — no batch decode
                 in_f       = self._effective_in()
@@ -3794,7 +3051,7 @@ class PlayerWidget(QWidget):
                 self._render_raw(raw)
 
         else:
-            # ── Forward play (wall-clock sync) ────────────────────────── #
+            # -- Forward play (wall-clock sync) -------------------------- #
             elapsed      = time.monotonic() - self._play_clock_start
             target_frame = int(self._play_frame_start + elapsed * self._fps * self._speed)
 
@@ -3804,7 +3061,7 @@ class PlayerWidget(QWidget):
                 self._close_loop_pipe()
 
             if self._frame_cache is not None:
-                # ── Cache mode ──────────────────────────────────────── #
+                # -- Cache mode ---------------------------------------- #
                 out  = min(self._effective_out(), len(self._frame_cache) - 1)
                 in_f = self._effective_in()
                 if target_frame > out:
@@ -3839,7 +3096,7 @@ class PlayerWidget(QWidget):
                 self._pipe_frame    = target_frame + 1
 
             elif self._use_window:
-                # ── Sliding window mode ──────────────────────────── #
+                # -- Sliding window mode ---------------------------- #
                 out  = self._effective_out()
                 in_f = self._effective_in()
                 if target_frame > out:
@@ -3881,7 +3138,7 @@ class PlayerWidget(QWidget):
                     self._wnd_anchor_at(target_frame)
 
             else:
-                # ── Pipe mode ───────────────────────────────────────── #
+                # -- Pipe mode ----------------------------------------- #
                 out         = self._effective_out()
                 raw         = None
                 eof         = False
@@ -4086,8 +3343,28 @@ class PlayerWidget(QWidget):
             tex = self._canvas.get_cached_tex(self._current_frame)
             if tex is not None:
                 self._canvas.set_cached_frame(tex)
+                self._push_frame_to_session(raw, w, h)
                 return
         self._canvas.set_frame(raw, w, h, is_hdr=self._is_hdr)
+        self._push_frame_to_session(raw, w, h)
+
+    def _push_frame_to_session(self, raw: bytes, w: int, h: int) -> None:
+        """Compress *raw* RGB24 to JPEG and stream to any connected followers."""
+        if not self._session_server or self._session_server.client_count == 0:
+            return
+        if self._is_hdr:
+            return
+        try:
+            img = QImage(raw, w, h, w * 3, QImage.Format_RGB888)
+            # QBuffer is an in-memory file Qt uses to write the JPEG into
+            buf = QBuffer()
+            buf.open(QBuffer.WriteOnly)
+            img.save(buf, 'JPEG', 65)
+            # JSON only carries text, so binary JPEG bytes go in as base64
+            b64 = base64.b64encode(bytes(buf.data())).decode('ascii')
+            self._session_server.broadcast({"type": "frame", "data": b64})
+        except Exception:
+            pass
 
     def _refresh_display(self):
         """Push current zoom/pan state to the GL canvas."""
@@ -4130,7 +3407,7 @@ class PlayerWidget(QWidget):
             was_playing = self._is_playing
 
             if target_idx != self._mc_idx:
-                # ── Cross-clip seek: lightweight switch, no load_video ──────
+                # -- Cross-clip seek: lightweight switch, no load_video ------
                 # load_video would reset the scrubber, trigger autoplay, and
                 # re-decode audio — none of which we want here. The full mc
                 # PCM buffer is already loaded; we only need to swap video state.
@@ -4471,12 +3748,12 @@ class PlayerWidget(QWidget):
         if self._session_server:
             n = self._session_server.client_count
             viewers = f"{n} viewer{'s' if n != 1 else ''}"
-            self._session_lbl.setText(f"● HOSTING  {viewers}")
+            self._session_lbl.setText(f"â— HOSTING  {viewers}")
             self._session_lbl.setStyleSheet(
                 "color:#4CAF50;font-size:10px;font-weight:bold;background:transparent;")
             self._session_lbl.setVisible(True)
         elif self._session_client and self._session_follower:
-            self._session_lbl.setText("● LIVE")
+            self._session_lbl.setText("â— LIVE")
             self._session_lbl.setStyleSheet(
                 f"color:{constants.ACCENT_HI};font-size:10px;font-weight:bold;background:transparent;")
             self._session_lbl.setVisible(True)
@@ -4491,9 +3768,23 @@ class PlayerWidget(QWidget):
             return False
         self._session_server.client_joined.connect(
             lambda _: self._session_update_label())
+        self._session_server.client_joined.connect(
+            lambda _: self._on_new_follower_joined())
         self._session_server.client_left.connect(
             lambda _: self._session_update_label())
         self._session_follower = False
+        # Pre-populate last_states so late joiners get current video info
+        if self._path:
+            self._session_broadcast({
+                "type": "load",
+                "path": self._path,
+                "fps": self._fps,
+                "total_frames": self._total_frames,
+            })
+            self._session_broadcast({
+                "type": "pause",
+                "frame": self._mc_offset() + self._current_frame,
+            })
         self._session_update_label()
         return True
 
@@ -4507,6 +3798,8 @@ class PlayerWidget(QWidget):
         self._session_client.stroke_received.connect(self._on_session_stroke)
         self._session_client.clear_received.connect(self._on_session_clear_frame)
         self._session_client.clear_all_received.connect(self._on_session_clear_all)
+        self._session_client.load_received.connect(self._on_session_load)
+        self._session_client.frame_received.connect(self._on_session_frame)
         self._session_client.disconnected.connect(self._on_session_disconnected)
         if not self._session_client.connect_to(host, port):
             self._session_client = None
@@ -4523,36 +3816,37 @@ class PlayerWidget(QWidget):
             self._session_client.disconnect()
             self._session_client = None
         self._session_follower = False
+        self._session_stream_mode = False
+        self._stream_overlay.hide()
         self._session_update_label()
 
-    # ── Receive handlers (followers) ─────────────────────────────────── #
+    # -- Receive handlers (followers) ----------------------------------- #
 
     def _on_session_seek(self, global_frame: int) -> None:
-        if not self._path:
-            return
         self._session_applying = True
         self._scrubber.setValue(global_frame)
-        self._on_scrubber_released()
+        if not self._session_stream_mode and self._path:
+            self._on_scrubber_released()
         self._session_applying = False
 
     def _on_session_play(self, global_frame: int) -> None:
-        if not self._path:
-            return
         self._session_applying = True
         self._scrubber.setValue(global_frame)
-        self._on_scrubber_released()
-        if not self._is_playing:
-            self._on_play_pause()
+        if not self._session_stream_mode and self._path:
+            self._on_scrubber_released()
+            if not self._is_playing:
+                self._on_play_pause()
         self._session_applying = False
 
     def _on_session_pause(self, global_frame: int) -> None:
-        if not self._path:
-            return
         self._session_applying = True
-        if self._is_playing:
-            self._on_play_pause()
-        self._scrubber.setValue(global_frame)
-        self._on_scrubber_released()
+        if not self._session_stream_mode and self._path:
+            if self._is_playing:
+                self._on_play_pause()
+            self._scrubber.setValue(global_frame)
+            self._on_scrubber_released()
+        else:
+            self._scrubber.setValue(global_frame)
         self._session_applying = False
 
     def _on_session_stroke(self, frame: int, stroke: dict) -> None:
@@ -4573,7 +3867,52 @@ class PlayerWidget(QWidget):
     def _on_session_disconnected(self) -> None:
         self._session_client = None
         self._session_follower = False
+        self._session_stream_mode = False
+        self._stream_overlay.hide()
         self._session_update_label()
+
+    def _on_session_load(self, path: str, _fps: float, total_frames: int) -> None:
+        """Host sent a video path.  Load it locally if we have it, otherwise stream."""
+        if Path(path).exists():
+            self._session_applying = True
+            self.load_video(path)
+            self._session_applying = False
+            self._session_stream_mode = False
+        else:
+            self._session_stream_mode = True
+            self._scrubber.blockSignals(True)
+            self._scrubber.setRange(0, max(0, total_frames - 1))
+            self._scrubber.setValue(0)
+            self._scrubber.blockSignals(False)
+
+    def _on_session_frame(self, jpeg_bytes: object) -> None:
+        if not self._session_stream_mode:
+            return
+        img = QImage.fromData(bytes(jpeg_bytes))
+        if img.isNull():
+            return
+        canvas_size = self._canvas.size()
+        pixmap = QPixmap.fromImage(img).scaled(
+            canvas_size, Qt.KeepAspectRatio, Qt.FastTransformation)
+        self._stream_overlay.setPixmap(pixmap)
+        self._stream_overlay.resize(canvas_size)
+        if not self._stream_overlay.isVisible():
+            self._stream_overlay.raise_()
+            self._stream_overlay.show()
+
+    def _on_new_follower_joined(self) -> None:
+        if not self._path or self._is_hdr:
+            return
+        w, h = self._effective_size()
+        if not w or not h:
+            return
+        raw = None
+        if self._frame_cache and 0 <= self._current_frame < len(self._frame_cache):
+            raw = self._frame_cache[self._current_frame]
+        elif self._use_window and self._current_frame in self._wnd:
+            raw = self._wnd[self._current_frame]
+        if raw:
+            self._push_frame_to_session(raw, w, h)
 
     def _ann_toggle_visibility(self) -> None:
         """Toggle annotation visibility from the Annotation menu."""
@@ -4932,11 +4271,11 @@ class PlayerWidget(QWidget):
         """
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Main window
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Playlist dock widget
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class _PlaylistDock(QDockWidget):
     """QDockWidget that corrects the Windows y=0 content-overlap bug and adds
@@ -5029,9 +4368,9 @@ class _PlaylistDock(QDockWidget):
         return super().nativeEvent(event_type, message)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  Custom dock title bar
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class _DockTitleBar(QWidget):
     """Replaces the native QDockWidget title bar with one that matches the UI."""
@@ -5050,15 +4389,40 @@ class _DockTitleBar(QWidget):
     def __init__(self, dock: QDockWidget, title: str = "",
                  sidebar=None) -> None:
         super().__init__(dock)
-        self._dock = dock
+        self._dock    = dock
+        self._title   = title
+        self._sidebar = sidebar
         self.setFixedHeight(34)
         self.setStyleSheet(f"background: {constants.BORDER};")
+        self.create_widgets()
+        self.create_layout()
+        self.create_connections()
 
+    def create_widgets(self):
+        self._float_btn  = self._mk_btn("maximize.png", "Float / Dock")
+        self._close_btn  = self._mk_btn("cancel.png", "Close")
+
+        self._up_btn  = None
+        self._dn_btn  = None
+        self._clr_btn = None
+        if self._sidebar is not None:
+            self._up_btn  = self._mk_btn("caret-arrow-up.png", "Move up")
+            self._dn_btn  = self._mk_btn("down.png", "Move down")
+            self._clr_btn = QPushButton("Clear")
+            self._clr_btn.setFixedSize(40, 22)
+            self._clr_btn.setFocusPolicy(Qt.NoFocus)
+            self._clr_btn.setStyleSheet(f"""
+                QPushButton{{background:{constants.ACCENT};color:{constants.TEXT_SEC};
+                    border:none;border-radius:3px;font-size:10px;}}
+                QPushButton:hover{{background:{constants.ACCENT_HI};color:white;}}
+            """)
+
+    def create_layout(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 0, 4, 0)
         layout.setSpacing(3)
 
-        lbl = QLabel(title)
+        lbl = QLabel(self._title)
         lbl.setStyleSheet(
             f"color: {constants.TEXT_PRI}; font-size: 12px;"
             f"font-weight: bold; background: transparent;"
@@ -5066,31 +4430,14 @@ class _DockTitleBar(QWidget):
         layout.addWidget(lbl)
         layout.addSpacing(8)
 
-        # Functional buttons sit left of the stretch, next to the title
-        if sidebar is not None:
-            up_btn = self._mk_btn("caret-arrow-up.png", "Move up")
-            up_btn.clicked.connect(sidebar._move_up)
-            dn_btn = self._mk_btn("down.png", "Move down")
-            dn_btn.clicked.connect(sidebar._move_down)
-            layout.addWidget(up_btn)
-            layout.addWidget(dn_btn)
+        if self._sidebar is not None:
+            layout.addWidget(self._up_btn)
+            layout.addWidget(self._dn_btn)
             layout.addSpacing(6)
+            layout.addWidget(self._clr_btn)
 
-            clr = QPushButton("Clear")
-            clr.setFixedSize(40, 22)
-            clr.setFocusPolicy(Qt.NoFocus)
-            clr.setStyleSheet(f"""
-                QPushButton{{background:{constants.ACCENT};color:{constants.TEXT_SEC};
-                    border:none;border-radius:3px;font-size:10px;}}
-                QPushButton:hover{{background:{constants.ACCENT_HI};color:white;}}
-            """)
-            clr.clicked.connect(sidebar.clear)
-            layout.addWidget(clr)
-
-        # Stretch pushes the window-action buttons to the far right
         layout.addStretch()
 
-        # Thin vertical separator before window-action buttons
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
         sep.setFixedWidth(1)
@@ -5098,16 +4445,17 @@ class _DockTitleBar(QWidget):
         sep.setStyleSheet(f"background: {constants.SPLITTER_COLOR}; border: none;")
         layout.addWidget(sep)
         layout.addSpacing(4)
-
-        self._float_btn = self._mk_btn("maximize.png", "Float / Dock")
-        self._float_btn.clicked.connect(self._toggle_float)
         layout.addWidget(self._float_btn)
+        layout.addWidget(self._close_btn)
 
-        close_btn = self._mk_btn("cancel.png", "Close")
-        close_btn.clicked.connect(dock.close)
-        layout.addWidget(close_btn)
-
-        dock.topLevelChanged.connect(self._on_top_level_changed)
+    def create_connections(self):
+        if self._sidebar is not None:
+            self._up_btn.clicked.connect(self._sidebar._move_up)
+            self._dn_btn.clicked.connect(self._sidebar._move_down)
+            self._clr_btn.clicked.connect(self._sidebar.clear)
+        self._float_btn.clicked.connect(self._toggle_float)
+        self._close_btn.clicked.connect(self._dock.close)
+        self._dock.topLevelChanged.connect(self._on_top_level_changed)
 
     def _mk_btn(self, icon_name: str, tip: str) -> QPushButton:
         btn = QPushButton()
@@ -5128,7 +4476,7 @@ class _DockTitleBar(QWidget):
         self._float_btn.setToolTip("Dock" if floating else "Float")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class BlastPlayerWindow(QMainWindow):
 
@@ -5140,20 +4488,23 @@ class BlastPlayerWindow(QMainWindow):
         self.setWindowTitle("BlastPlayer")
         self.setMinimumSize(900, 560)
         self.setAcceptDrops(True)
+        self.create_widgets()
+        self.create_layout()
+        self.create_connections()
 
+    def create_widgets(self):
         self._player  = PlayerWidget(self)
         self._welcome = WelcomeWidget(self)
         self._current_filename = ""
         self._ocio    = OCIOManager()
+        self._stack   = QStackedWidget()
+        self._fs_dock_was_visible = False
 
+    def create_layout(self):
         self._player.set_frame_callback(self._update_title)
-
-        self._stack = QStackedWidget()
         self._stack.addWidget(self._welcome)
         self._stack.addWidget(self._player)
         self.setCentralWidget(self._stack)
-
-        self._fs_dock_was_visible = False
         self._build_menu()
         self._setup_shortcuts()
         self._build_playlist_dock()
@@ -5161,6 +4512,8 @@ class BlastPlayerWindow(QMainWindow):
         self._build_fullscreen_timer()
         self._restore_geometry()
         self._restore_settings()
+
+    def create_connections(self):
         self._player.video_ended.connect(self._on_video_ended)
         self._player.audio_loading.connect(self._playlist.set_audio_loading)
 
@@ -5187,7 +4540,7 @@ class BlastPlayerWindow(QMainWindow):
         self._playlist_dock.setVisible(False)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._playlist_dock)
 
-        # Sync toggle button ↔ dock visibility
+        # Sync toggle button â†" dock visibility
         self._player._playlist_btn.toggled.connect(self._playlist_dock.setVisible)
         self._playlist_dock.visibilityChanged.connect(
             self._player._playlist_btn.setChecked)
@@ -5208,7 +4561,7 @@ class BlastPlayerWindow(QMainWindow):
     def _build_annotation_panel(self):
         ann = self._player._ann_panel
 
-        # Panel signals → canvas repaint / player actions / menu sync
+        # Panel signals â†' canvas repaint / player actions / menu sync
         ann.changed.connect(self._player._canvas.update)
         ann.changed.connect(self._sync_ann_menu_state)
         ann.changed.connect(self._player._refresh_ann_markers)
@@ -5839,7 +5192,7 @@ class BlastPlayerWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self._player._annotations.is_dirty():
-            result = _ann_save_dialog(self, "Save annotations before closing?")
+            result = AnnSaveDialog.ask("Save annotations before closing?", self)
             if result == 2:
                 self._player._on_ann_save()
             elif result == 0:

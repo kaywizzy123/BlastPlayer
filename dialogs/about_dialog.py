@@ -16,6 +16,7 @@ class AboutDialog(QDialog):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.create_widgets()
         self.create_layout()
+        self.create_connections()
 
     def create_widgets(self):
         self.logo_label = QLabel()
@@ -61,7 +62,6 @@ class AboutDialog(QDialog):
                 background-color: {constants.ACCENT};
             }}
         """)
-        self.close_button.clicked.connect(self.close)
 
     def create_layout(self):
         main_layout = QVBoxLayout(self)
@@ -78,3 +78,6 @@ class AboutDialog(QDialog):
         button_layout.addWidget(self.close_button)
         button_layout.addStretch()
         main_layout.addLayout(button_layout)
+
+    def create_connections(self):
+        self.close_button.clicked.connect(self.close)

@@ -1,12 +1,8 @@
-"""
+﻿"""
 BlastPlayer collaborative review session.
 
-Architecture
-------------
 One machine hosts (SessionServer); others join (SessionClient).
-Only the host's playback controls propagate to followers — followers
-are read-only by default.  Messages are newline-delimited JSON over a
-plain TCP socket so no extra dependencies are required.
+Messages are newline-delimited JSON over a plain TCP socket.
 
 Message types
 -------------
@@ -16,10 +12,13 @@ pause       {"type":"pause", "frame":<int>}
 stroke      {"type":"stroke","frame":<int>,"stroke":<dict>}
 clear_frame {"type":"clear_frame","frame":<int>}
 clear_all   {"type":"clear_all"}
+load        {"type":"load","path":<str>,"fps":<float>,"total_frames":<int>}
+frame       {"type":"frame","data":<base64_jpeg>}
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import threading
@@ -27,7 +26,7 @@ import threading
 from PyQt5.QtCore import QObject, pyqtSignal
 
 
-# ── Server ────────────────────────────────────────────────────────────────────
+# -- Server --------------------------------------------------------------------
 
 class SessionServer(QObject):
     """Runs on the host machine.  Broadcasts state to all connected clients."""
@@ -40,13 +39,14 @@ class SessionServer(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._clients:  list[socket.socket] = []
-        self._lock      = threading.Lock()
-        self._sock      = None
-        self._running   = False
-        self._last_state: dict = {}   # sent to new joiners so they sync immediately
+        self._clients: list[socket.socket] = []
+        self._lock    = threading.Lock()
+        self._sock    = None
+        self._running = False
+        # Snapshots replayed to late joiners — 'load' and 'position' stored separately
+        self._last_states: dict[str, dict] = {}
 
-    # ── Lifecycle ─────────────────────────────────────────────────────── #
+    # -- Lifecycle ------------------------------------------------------- #
 
     def start(self, port: int = DEFAULT_PORT) -> bool:
         try:
@@ -72,13 +72,19 @@ class SessionServer(QObject):
                 try: c.close()
                 except Exception: pass
             self._clients.clear()
-        self._last_state.clear()
+        self._last_states.clear()
 
-    # ── Broadcast ─────────────────────────────────────────────────────── #
+    # -- Broadcast ------------------------------------------------------- #
 
     def broadcast(self, msg: dict) -> None:
         """Send *msg* to every connected follower."""
-        self._last_state = msg          # remember for late joiners
+        t = msg.get('type', '')
+        if t == 'load':
+            self._last_states['load'] = msg
+        elif t in ('seek', 'pause', 'play'):
+            self._last_states['position'] = msg   # only the latest position matters
+        # 'frame' is not stored — it's large and transient
+
         data = (json.dumps(msg, separators=(',', ':')) + '\n').encode()
         dead: list[socket.socket] = []
         with self._lock:
@@ -90,7 +96,7 @@ class SessionServer(QObject):
             for c in dead:
                 self._clients.remove(c)
 
-    # ── Properties ────────────────────────────────────────────────────── #
+    # -- Properties ------------------------------------------------------ #
 
     @property
     def client_count(self) -> int:
@@ -108,7 +114,7 @@ class SessionServer(QObject):
         except Exception:
             return '127.0.0.1'
 
-    # ── Internal ──────────────────────────────────────────────────────── #
+    # -- Internal -------------------------------------------------------- #
 
     def _accept_loop(self) -> None:
         while self._running:
@@ -119,18 +125,23 @@ class SessionServer(QObject):
             addr_str = f"{addr[0]}:{addr[1]}"
             with self._lock:
                 self._clients.append(conn)
-            # Immediately sync the new joiner to the host's current state
-            if self._last_state:
-                try:
-                    conn.sendall(
-                        (json.dumps(self._last_state, separators=(',', ':')) + '\n').encode()
-                    )
-                except Exception:
-                    pass
+            self._sync_new_client(conn)
             self.client_joined.emit(addr_str)
             threading.Thread(
                 target=self._watch_client, args=(conn, addr_str), daemon=True
             ).start()
+
+    def _sync_new_client(self, conn: socket.socket) -> None:
+        """Replay load + position snapshots so a new joiner is immediately in sync."""
+        for key in ('load', 'position'):
+            msg = self._last_states.get(key)
+            if msg:
+                try:
+                    conn.sendall(
+                        (json.dumps(msg, separators=(',', ':')) + '\n').encode()
+                    )
+                except Exception:
+                    pass
 
     def _watch_client(self, conn: socket.socket, addr_str: str) -> None:
         """Detect when a client disconnects (we don't expect data from them)."""
@@ -149,7 +160,7 @@ class SessionServer(QObject):
         except Exception: pass
 
 
-# ── Client ────────────────────────────────────────────────────────────────────
+# -- Client --------------------------------------------------------------------
 
 class SessionClient(QObject):
     """Runs on follower machines.  Receives state from the host."""
@@ -160,6 +171,8 @@ class SessionClient(QObject):
     stroke_received    = pyqtSignal(int, object)   # (frame, stroke_dict)
     clear_received     = pyqtSignal(int)
     clear_all_received = pyqtSignal()
+    load_received      = pyqtSignal(str, float, int)   # (path, fps, total_frames)
+    frame_received     = pyqtSignal(object)            # bytes: JPEG-compressed frame
     connected          = pyqtSignal()
     disconnected       = pyqtSignal()
     connect_error      = pyqtSignal(str)
@@ -169,7 +182,7 @@ class SessionClient(QObject):
         self._sock    = None
         self._running = False
 
-    # ── Lifecycle ─────────────────────────────────────────────────────── #
+    # -- Lifecycle ------------------------------------------------------- #
 
     def connect_to(self, host: str,
                    port: int = SessionServer.DEFAULT_PORT) -> bool:
@@ -193,13 +206,13 @@ class SessionClient(QObject):
             except Exception: pass
             self._sock = None
 
-    # ── Internal ──────────────────────────────────────────────────────── #
+    # -- Internal -------------------------------------------------------- #
 
     def _recv_loop(self) -> None:
         buf = ''
         try:
             while self._running:
-                chunk = self._sock.recv(4096)
+                chunk = self._sock.recv(65536)
                 if not chunk:
                     break
                 buf += chunk.decode(errors='replace')
@@ -229,3 +242,14 @@ class SessionClient(QObject):
             self.clear_received.emit(int(msg['frame']))
         elif t == 'clear_all':
             self.clear_all_received.emit()
+        elif t == 'load':
+            self.load_received.emit(
+                str(msg.get('path', '')),
+                float(msg.get('fps', 24.0)),
+                int(msg.get('total_frames', 0)),
+            )
+        elif t == 'frame':
+            try:
+                self.frame_received.emit(base64.b64decode(msg['data']))
+            except Exception:
+                pass
