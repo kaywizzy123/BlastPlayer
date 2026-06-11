@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
     QApplication, QLineEdit, QInputDialog, QProgressBar,
     QStyledItemDelegate, QAbstractItemView, QStyle, QSizeGrip,
 )
-from PyQt5.QtCore import Qt, QTimer, QSize, QRect, QRectF, QPointF, QThread, pyqtSignal, QSettings, QObject
+from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, QRect, QRectF, QPointF, QThread, pyqtSignal, QSettings, QObject
 from PyQt5.QtGui import (
     QKeySequence, QPainter, QPen, QColor, QImage,
     QPixmap, QFont, QFontMetrics, QDragEnterEvent, QDropEvent, QIcon,
@@ -1638,16 +1638,24 @@ class AnnotationLayer:
         self.show_in_playback: bool = True
         self.active_tool:      str  = "pen"
         self.pen_color:        str  = "#ff4444"
-        self.pen_thickness:    int  = 5
-        self.eraser_thickness: int  = 24
+        self._tool_thickness: dict = {
+            "pen": 5, "line": 3, "arrow": 3,
+            "rect": 3, "ellipse": 3, "eraser": 24,
+        }
         self._path:            str  = ""
 
     def begin_stroke(self, u: float, v: float) -> None:
-        t = self.pen_thickness if self.active_tool == "pen" else self.eraser_thickness
+        t = self._tool_thickness.get(self.active_tool, 5)
         self._in_progress = {
             "tool": self.active_tool, "color": self.pen_color,
             "thickness": t, "points": [(u, v)],
         }
+
+    def get_thickness(self, tool: str) -> int:
+        return self._tool_thickness.get(tool, 5)
+
+    def set_thickness(self, tool: str, value: int) -> None:
+        self._tool_thickness[tool] = value
 
     def extend_stroke(self, u: float, v: float) -> None:
         if not self._in_progress:
@@ -1741,6 +1749,18 @@ class AnnotationLayer:
 #  Annotation panel (dockable vertical sidebar)
 # ══════════════════════════════════════════════════════════════════════════════
 
+class _AnnotToolBtn(QPushButton):
+    """Tool button that emits right_clicked on right mouse press."""
+    right_clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.right_clicked.emit()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+
 class _AnnotationPanel(QWidget):
     """Compact icon-only vertical annotation sidebar — hosted in a QDockWidget."""
 
@@ -1776,16 +1796,17 @@ class _AnnotationPanel(QWidget):
 
         # ── Tool buttons (single column) ──────────────────────────────────
         for tool, icon_file, tip in self._TOOLS:
-            btn = QPushButton()
+            btn = _AnnotToolBtn()
             btn.setIcon(_icon(icon_file))
             btn.setIconSize(QSize(18, 18))
             btn.setCheckable(True)
             btn.setChecked(tool == "pen")
             btn.setFocusPolicy(Qt.NoFocus)
             btn.setFixedHeight(36)
-            btn.setToolTip(tip)
+            btn.setToolTip(f"{tip}  (right-click to set size)")
             btn.setStyleSheet(self._tool_style(tool == "pen"))
             btn.toggled.connect(lambda checked, t=tool, b=btn: self._on_tool_toggled(t, b, checked))
+            btn.right_clicked.connect(lambda t=tool, b=btn: self._show_size_popup(t, b))
             self._tool_btns[tool] = btn
             root.addWidget(btn)
 
@@ -1799,38 +1820,6 @@ class _AnnotationPanel(QWidget):
         self._color_btn.clicked.connect(self._pick_color)
         root.addWidget(self._color_btn)
         self._refresh_color_btn()
-
-        root.addWidget(self._sep_h())
-
-        # ── Pen size ──────────────────────────────────────────────────────
-        self._pen_size_lbl = QLabel(f"Pen  {self._ann.pen_thickness}")
-        self._pen_size_lbl.setAlignment(Qt.AlignCenter)
-        self._pen_size_lbl.setStyleSheet(
-            f"color:{constants.TEXT_SEC};font-size:9px;background:transparent;")
-        root.addWidget(self._pen_size_lbl)
-
-        self._pen_slider = QSlider(Qt.Horizontal)
-        self._pen_slider.setRange(1, 50)
-        self._pen_slider.setValue(self._ann.pen_thickness)
-        self._pen_slider.setFocusPolicy(Qt.NoFocus)
-        self._pen_slider.setStyleSheet(self._slider_style())
-        self._pen_slider.valueChanged.connect(self._on_pen_size)
-        root.addWidget(self._pen_slider)
-
-        # ── Eraser size ───────────────────────────────────────────────────
-        self._eraser_size_lbl = QLabel(f"Eraser  {self._ann.eraser_thickness}")
-        self._eraser_size_lbl.setAlignment(Qt.AlignCenter)
-        self._eraser_size_lbl.setStyleSheet(
-            f"color:{constants.TEXT_SEC};font-size:9px;background:transparent;")
-        root.addWidget(self._eraser_size_lbl)
-
-        self._eraser_slider = QSlider(Qt.Horizontal)
-        self._eraser_slider.setRange(4, 100)
-        self._eraser_slider.setValue(self._ann.eraser_thickness)
-        self._eraser_slider.setFocusPolicy(Qt.NoFocus)
-        self._eraser_slider.setStyleSheet(self._slider_style())
-        self._eraser_slider.valueChanged.connect(self._on_eraser_size)
-        root.addWidget(self._eraser_slider)
 
         root.addWidget(self._sep_h())
 
@@ -1929,15 +1918,13 @@ class _AnnotationPanel(QWidget):
 
     @staticmethod
     def _slider_style() -> str:
-        return f"""
-            QSlider::groove:horizontal{{background:#333;height:4px;border-radius:2px;}}
-            QSlider::handle:horizontal{{
-                background:{constants.TEXT_PRI};
-                width:12px;height:12px;border-radius:6px;margin:-4px 0;
-            }}
-            QSlider::handle:horizontal:hover{{background:{constants.ACCENT_HI};}}
-            QSlider::sub-page:horizontal{{background:{constants.ACCENT_HI};border-radius:2px;}}
-        """
+        return (
+            f"QSlider::groove:horizontal{{background:#333;height:4px;border-radius:2px;}}"
+            f"QSlider::handle:horizontal{{background:{constants.TEXT_PRI};"
+            f"width:10px;height:10px;border-radius:0px;margin:-3px 0;}}"
+            f"QSlider::handle:horizontal:hover{{background:{constants.ACCENT_HI};}}"
+            f"QSlider::sub-page:horizontal{{background:{constants.ACCENT_HI};border-radius:2px;}}"
+        )
 
     # ── Color ─────────────────────────────────────────────────────────── #
 
@@ -1980,17 +1967,59 @@ class _AnnotationPanel(QWidget):
                 btn.blockSignals(False)
             btn.setStyleSheet(self._tool_style(btn.isChecked()))
 
-    # ── Size slots ────────────────────────────────────────────────────── #
+    # ── Size popup (right-click on any tool button) ───────────────────── #
 
-    def _on_pen_size(self, value: int) -> None:
-        self._ann.pen_thickness = value
-        self._pen_size_lbl.setText(f"Pen  {value}")
-        self.changed.emit()
+    def _show_size_popup(self, tool: str, btn: _AnnotToolBtn) -> None:
+        lo, hi = (4, 100) if tool == "eraser" else (1, 50)
+        current = self._ann.get_thickness(tool)
 
-    def _on_eraser_size(self, value: int) -> None:
-        self._ann.eraser_thickness = value
-        self._eraser_size_lbl.setText(f"Eraser  {value}")
-        self.changed.emit()
+        # Use self as parent so Qt owns the lifetime; also store on self so
+        # Python's reference count never drops to zero before it's shown.
+        popup = QWidget(self, Qt.Popup | Qt.FramelessWindowHint)
+        self._size_popup = popup
+        popup.setStyleSheet(
+            f"QWidget{{background:#232323;border:none;border-radius:6px;}}"
+            f"QLabel{{color:{constants.TEXT_PRI};font-size:10px;"
+            f"background:transparent;border:none;}}")
+
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(2)
+
+        lbl = QLabel(f"Size: {current}")
+        lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(lo, hi)
+        slider.setValue(current)
+        slider.setFixedWidth(150)
+        slider.setFocusPolicy(Qt.StrongFocus)
+        slider.setStyleSheet(self._slider_style())
+        layout.addWidget(slider)
+
+        def _on_change(v: int) -> None:
+            self._ann.set_thickness(tool, v)
+            lbl.setText(f"Size: {v}")
+            self.changed.emit()
+
+        slider.valueChanged.connect(_on_change)
+
+        popup.adjustSize()
+        pw = popup.width()
+        ph = popup.height()
+        # Prefer left of the button (panel is on the right edge of the window)
+        btn_global = btn.mapToGlobal(QPoint(0, 0))
+        x = btn_global.x() - pw - 4
+        y = btn_global.y()
+        # Clamp to screen so it never falls off any edge
+        screen = btn.screen().availableGeometry() if hasattr(btn, 'screen') else \
+                 QApplication.primaryScreen().availableGeometry()
+        x = max(screen.left(), min(x, screen.right()  - pw))
+        y = max(screen.top(),  min(y, screen.bottom() - ph))
+        popup.move(x, y)
+        popup.show()
+        slider.setFocus()
 
     # ── Visibility slots ──────────────────────────────────────────────── #
 
@@ -4350,7 +4379,10 @@ class PlayerWidget(QWidget):
         elif k == Qt.Key_L:                      self._play(reverse=False)
         elif k == Qt.Key_J:                      self._play(reverse=True)
         elif k == Qt.Key_K:                      self._pause()
-        elif k == Qt.Key_A and ctrl and shift:   self._ann_btn.setChecked(not self._ann_btn.isChecked())
+        elif k == Qt.Key_Z and ctrl and not shift: self._on_ann_undo()
+        elif k == Qt.Key_Y and ctrl:               self._on_ann_redo()
+        elif k == Qt.Key_Z and ctrl and shift:     self._on_ann_redo()
+        elif k == Qt.Key_A and ctrl and shift:     self._ann_btn.setChecked(not self._ann_btn.isChecked())
         elif k == Qt.Key_Left  and not ctrl:     self._step_back()
         elif k == Qt.Key_Right and not ctrl:     self._step_forward()
         elif k == Qt.Key_Home:                   self._go_first()
@@ -4745,8 +4777,7 @@ class BlastPlayerWindow(QMainWindow):
             Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._ann_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self._ann_dock.setTitleBarWidget(QWidget())
-        self._ann_dock.setMinimumWidth(64)
-        self._ann_dock.setMaximumWidth(120)
+        self._ann_dock.setFixedWidth(52)
         self._ann_dock.setVisible(False)
         self.addDockWidget(Qt.RightDockWidgetArea, self._ann_dock)
 
@@ -4788,8 +4819,10 @@ class BlastPlayerWindow(QMainWindow):
 
         # Edit
         em = mb.addMenu("Edit")
-        em.addAction("Undo").setShortcut("Ctrl+Z")
-        em.addAction("Redo").setShortcut("Ctrl+Y")
+        undo_act = em.addAction("Undo"); undo_act.setShortcut("Ctrl+Z")
+        undo_act.triggered.connect(self._player._on_ann_undo)
+        redo_act = em.addAction("Redo"); redo_act.setShortcut("Ctrl+Y")
+        redo_act.triggered.connect(self._player._on_ann_redo)
         em.addSeparator()
         em.addAction("Copy Frame").setShortcut("Ctrl+C")
 
