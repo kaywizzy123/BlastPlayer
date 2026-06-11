@@ -856,6 +856,7 @@ class ScrubberSlider(QSlider):
         self._in_frame  = None   # int | None
         self._out_frame = None   # int | None
         self._mc_clips  = []     # list of clip dicts for multi-clip band painting
+        self._ann_frames: set = set()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -917,9 +918,14 @@ class ScrubberSlider(QSlider):
         self._mc_clips = clips
         self.update()
 
+    def set_annotation_frames(self, frames: set) -> None:
+        self._ann_frames = frames
+        self.update()
+
     def paintEvent(self, event):
         super().paintEvent(event)
-        if self._in_frame is None and self._out_frame is None and not self._mc_clips:
+        if (self._in_frame is None and self._out_frame is None
+                and not self._mc_clips and not self._ann_frames):
             return
 
         opt    = QStyleOptionSlider()
@@ -979,6 +985,14 @@ class ScrubberSlider(QSlider):
             x = x_for(self._out_frame)
             painter.drawLine(x, gy - 7, x, gy + 7)
 
+        # Annotation frame markers — vertical ticks on the groove
+        if self._ann_frames:
+            painter.setPen(QPen(QColor("#FFD700"), 2))
+            for frame in self._ann_frames:
+                if self.minimum() <= frame <= self.maximum():
+                    x = x_for(frame)
+                    painter.drawLine(x, gy - 5, x, gy + 5)
+
         painter.end()
 
 
@@ -996,8 +1010,9 @@ class VideoCanvas(QOpenGLWidget):
     - OCIO colour-management via injected GLSL function + LUT textures
     """
 
-    zoom_scrolled = pyqtSignal(int)       # +1 = in, -1 = out
-    pan_dragged   = pyqtSignal(int, int)  # dx, dy
+    zoom_scrolled    = pyqtSignal(int)       # +1 = in, -1 = out
+    pan_dragged      = pyqtSignal(int, int)  # dx, dy
+    stroke_committed = pyqtSignal()
 
     # GLSL 1.50 core — OpenGL 3.2 Core Profile (required by macOS; supported
     # on all modern Windows/Linux drivers too).
@@ -1627,6 +1642,7 @@ void main() {
             if self._ann_layer:
                 self._ann_layer.end_stroke(self._ann_frame)
                 self.update()
+                self.stroke_committed.emit()
             event.accept()
             return
         if event.button() == Qt.MiddleButton:
@@ -3313,6 +3329,7 @@ class PlayerWidget(QWidget):
         self._canvas = VideoCanvas()
         self._canvas.zoom_scrolled.connect(self._on_zoom_scroll)
         self._canvas.pan_dragged.connect(self._on_pan_drag)
+        self._canvas.stroke_committed.connect(self._refresh_ann_markers)
 
         root.addWidget(self._canvas, stretch=1)
 
@@ -4217,18 +4234,25 @@ class PlayerWidget(QWidget):
     def _on_ann_undo(self) -> None:
         self._annotations.undo_stroke(self._current_frame)
         self._canvas.update()
+        self._refresh_ann_markers()
 
     def _on_ann_redo(self) -> None:
         self._annotations.redo_stroke(self._current_frame)
         self._canvas.update()
+        self._refresh_ann_markers()
 
     def _on_ann_clear_frame(self) -> None:
         self._annotations.clear_frame(self._current_frame)
         self._canvas.update()
+        self._refresh_ann_markers()
 
     def _on_ann_clear_all(self) -> None:
         self._annotations.clear_all()
         self._canvas.update()
+        self._refresh_ann_markers()
+
+    def _refresh_ann_markers(self) -> None:
+        self._scrubber.set_annotation_frames(set(self._annotations.strokes.keys()))
 
     def _ann_toggle_visibility(self) -> None:
         """Toggle annotation visibility from the Annotation menu."""
@@ -4883,6 +4907,7 @@ class BlastPlayerWindow(QMainWindow):
         # Panel signals → canvas repaint / player actions / menu sync
         self._ann_panel.changed.connect(self._player._canvas.update)
         self._ann_panel.changed.connect(self._sync_ann_menu_state)
+        self._ann_panel.changed.connect(self._player._refresh_ann_markers)
         self._ann_panel.undo_req.connect(self._player._on_ann_undo)
         self._ann_panel.redo_req.connect(self._player._on_ann_redo)
         self._ann_panel.clear_frame_req.connect(self._player._on_ann_clear_frame)
