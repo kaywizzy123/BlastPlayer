@@ -1682,10 +1682,9 @@ class AnnotationLayer:
             "rect": 3, "ellipse": 3, "eraser": 24,
         }
         self.ghost_enabled: bool = False
-        self.ghost_before:  int  = 1   # frames to show before current
-        self.ghost_after:   int  = 1   # frames to show after current
         self._path:         str  = ""
         self._dirty:        bool = False
+        self._clipboard:    list = []   # copied strokes (deep copy, frame-independent)
 
     def begin_stroke(self, u: float, v: float) -> None:
         t = self._tool_thickness.get(self.active_tool, 5)
@@ -1753,6 +1752,21 @@ class AnnotationLayer:
         self.strokes.clear()
         self._redo.clear()
         self._dirty = True
+
+    def copy_frame(self, frame: int) -> None:
+        import copy
+        self._clipboard = copy.deepcopy(self.strokes.get(frame, []))
+
+    def paste_frame(self, frame: int) -> None:
+        if not self._clipboard:
+            return
+        import copy
+        self.strokes[frame] = copy.deepcopy(self._clipboard)
+        self._redo.pop(frame, None)
+        self._dirty = True
+
+    def has_clipboard(self) -> bool:
+        return bool(self._clipboard)
 
     def is_dirty(self) -> bool:
         return self._dirty
@@ -1825,6 +1839,8 @@ class _AnnotationPanel(QWidget):
     changed         = pyqtSignal()
     undo_req        = pyqtSignal()
     redo_req        = pyqtSignal()
+    copy_req        = pyqtSignal()
+    paste_req       = pyqtSignal()
     clear_frame_req = pyqtSignal()
     clear_all_req   = pyqtSignal()
 
@@ -1847,7 +1863,7 @@ class _AnnotationPanel(QWidget):
     # ── Build ─────────────────────────────────────────────────────────── #
 
     def _build_ui(self) -> None:
-        self.setStyleSheet(f"background:{constants.BG};")
+        self.setStyleSheet(f"background:{constants.BORDER};")
         root = QVBoxLayout(self)
         root.setContentsMargins(3, 5, 3, 5)
         root.setSpacing(3)
@@ -1883,10 +1899,12 @@ class _AnnotationPanel(QWidget):
 
         # ── Action buttons (single column) ────────────────────────────────
         for icon_file, tip, sig in (
-            ("undo.png",   "Undo last stroke",  self.undo_req),
-            ("redo.png",   "Redo last stroke",  self.redo_req),
-            ("cancel.png", "Clear this frame",  self.clear_frame_req),
-            ("bin.png",    "Clear all frames",  self.clear_all_req),
+            ("undo.png",   "Undo last stroke",      self.undo_req),
+            ("redo.png",   "Redo last stroke",      self.redo_req),
+            ("copy.png",   "Copy frame annotations",  self.copy_req),
+            ("paste.png",  "Paste annotations here",  self.paste_req),
+            ("cancel.png", "Clear this frame",      self.clear_frame_req),
+            ("bin.png",    "Clear all frames",      self.clear_all_req),
         ):
             btn = QPushButton()
             btn.setIcon(_icon(icon_file))
@@ -1925,7 +1943,7 @@ class _AnnotationPanel(QWidget):
         self._pb_btn.toggled.connect(self._on_pb_toggled)
         root.addWidget(self._pb_btn)
 
-        self._ghost_btn = _AnnotToolBtn()
+        self._ghost_btn = QPushButton()
         self._ghost_btn.setIcon(_icon("ghost.png"))
         self._ghost_btn.setIconSize(QSize(14, 14))
         self._ghost_btn.setCheckable(True)
@@ -1935,8 +1953,6 @@ class _AnnotationPanel(QWidget):
         self._ghost_btn.setToolTip("Ghost  (right-click to set frame range)")
         self._ghost_btn.setStyleSheet(self._toggle_style(False))
         self._ghost_btn.toggled.connect(self._on_ghost_toggled)
-        self._ghost_btn.right_clicked.connect(
-            lambda: self._show_ghost_popup(self._ghost_btn))
         root.addWidget(self._ghost_btn)
 
         root.addStretch()
@@ -2111,51 +2127,6 @@ class _AnnotationPanel(QWidget):
         self._ghost_btn.setStyleSheet(self._toggle_style(checked))
         self.changed.emit()
 
-    def _show_ghost_popup(self, btn: _AnnotToolBtn) -> None:
-        popup = QWidget(self, Qt.Popup | Qt.FramelessWindowHint)
-        self._ghost_popup = popup
-        popup.setStyleSheet(
-            f"QWidget{{background:#232323;border:none;border-radius:6px;}}"
-            f"QLabel{{color:{constants.TEXT_PRI};font-size:10px;"
-            f"background:transparent;border:none;}}")
-
-        layout = QVBoxLayout(popup)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(2)
-
-        for attr, label_text in (("ghost_before", "Before"), ("ghost_after", "After")):
-            current = getattr(self._ann, attr)
-            lbl = QLabel(f"{label_text}: {current}")
-            lbl.setAlignment(Qt.AlignCenter)
-            layout.addWidget(lbl)
-
-            slider = QSlider(Qt.Horizontal)
-            slider.setRange(0, 10)
-            slider.setValue(current)
-            slider.setFixedWidth(150)
-            slider.setFocusPolicy(Qt.StrongFocus)
-            slider.setStyleSheet(self._slider_style())
-
-            def _on_change(v: int, a=attr, l=lbl, lt=label_text) -> None:
-                setattr(self._ann, a, v)
-                l.setText(f"{lt}: {v}")
-                self.changed.emit()
-
-            slider.valueChanged.connect(_on_change)
-            layout.addWidget(slider)
-
-        popup.adjustSize()
-        btn_global = btn.mapToGlobal(QPoint(0, 0))
-        pw = popup.width()
-        ph = popup.height()
-        x = btn_global.x() - pw - 4
-        y = btn_global.y()
-        screen = btn.screen().availableGeometry() if hasattr(btn, 'screen') else \
-                 QApplication.primaryScreen().availableGeometry()
-        x = max(screen.left(), min(x, screen.right()  - pw))
-        y = max(screen.top(),  min(y, screen.bottom() - ph))
-        popup.move(x, y)
-        popup.show()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2362,6 +2333,7 @@ class PlayerWidget(QWidget):
 
         # Annotation state
         self._annotations = AnnotationLayer()
+        self._ann_panel   = _AnnotationPanel(self._annotations)
 
         self._build_ui()
 
@@ -3390,9 +3362,19 @@ class PlayerWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def _build_ui(self):
-        root = QVBoxLayout(self)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        _content = QWidget()
+        root = QVBoxLayout(_content)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+        outer.addWidget(_content, stretch=1)
+
+        self._ann_panel.setFixedWidth(40)
+        self._ann_panel.setVisible(False)
+        outer.addWidget(self._ann_panel)
 
         # ── Content row: video canvas ─────────────────────────────────────
         self._canvas = VideoCanvas()
@@ -3483,7 +3465,7 @@ class PlayerWidget(QWidget):
         tr.addWidget(self._playlist_btn)
 
         self._ann_btn = QPushButton()
-        ic_ann = _icon("edit.png")
+        ic_ann = _icon("palette.png")
         if not ic_ann.isNull():
             self._ann_btn.setIcon(ic_ann)
             self._ann_btn.setIconSize(QSize(14, 14))
@@ -4295,6 +4277,7 @@ class PlayerWidget(QWidget):
 
     def _toggle_annotation_toolbar(self, checked: bool) -> None:
         self._ann_btn.setStyleSheet(self._loop_style(checked))
+        self._ann_panel.setVisible(checked)
         self._canvas.annotation_drawing = checked
         if not checked and self._annotations._in_progress:
             self._annotations.cancel_stroke()
@@ -4322,6 +4305,14 @@ class PlayerWidget(QWidget):
 
     def _refresh_ann_markers(self) -> None:
         self._scrubber.set_annotation_frames(set(self._annotations.strokes.keys()))
+
+    def _on_ann_copy(self) -> None:
+        self._annotations.copy_frame(self._current_frame)
+
+    def _on_ann_paste(self) -> None:
+        self._annotations.paste_frame(self._current_frame)
+        self._canvas.update()
+        self._refresh_ann_markers()
 
     def _on_ann_save(self) -> None:
         self._annotations.save()
@@ -4913,7 +4904,7 @@ class BlastPlayerWindow(QMainWindow):
         self._build_menu()
         self._setup_shortcuts()
         self._build_playlist_dock()
-        self._build_annotation_dock()
+        self._build_annotation_panel()
         self._build_fullscreen_timer()
         self._restore_geometry()
         self._restore_settings()
@@ -4961,34 +4952,19 @@ class BlastPlayerWindow(QMainWindow):
     #  Annotation dock                                                     #
     # ------------------------------------------------------------------ #
 
-    def _build_annotation_dock(self):
-        self._ann_panel = _AnnotationPanel(self._player._annotations)
-
-        self._ann_dock = QDockWidget(self)
-        self._ann_dock.setObjectName("AnnotationDock")
-        self._ann_dock.setWidget(self._ann_panel)
-        self._ann_dock.setAllowedAreas(
-            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self._ann_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
-        self._ann_dock.setTitleBarWidget(QWidget())
-        self._ann_dock.setFixedWidth(40)
-        self._ann_dock.setVisible(False)
-        self.addDockWidget(Qt.RightDockWidgetArea, self._ann_dock)
-
-        # Sync toggle button ↔ dock visibility
-        self._player._ann_btn.toggled.connect(self._ann_dock.setVisible)
-        self._ann_dock.visibilityChanged.connect(self._player._ann_btn.setChecked)
-        self._ann_dock.visibilityChanged.connect(
-            self._player._toggle_annotation_toolbar)
+    def _build_annotation_panel(self):
+        ann = self._player._ann_panel
 
         # Panel signals → canvas repaint / player actions / menu sync
-        self._ann_panel.changed.connect(self._player._canvas.update)
-        self._ann_panel.changed.connect(self._sync_ann_menu_state)
-        self._ann_panel.changed.connect(self._player._refresh_ann_markers)
-        self._ann_panel.undo_req.connect(self._player._on_ann_undo)
-        self._ann_panel.redo_req.connect(self._player._on_ann_redo)
-        self._ann_panel.clear_frame_req.connect(self._player._on_ann_clear_frame)
-        self._ann_panel.clear_all_req.connect(self._player._on_ann_clear_all)
+        ann.changed.connect(self._player._canvas.update)
+        ann.changed.connect(self._sync_ann_menu_state)
+        ann.changed.connect(self._player._refresh_ann_markers)
+        ann.undo_req.connect(self._player._on_ann_undo)
+        ann.redo_req.connect(self._player._on_ann_redo)
+        ann.copy_req.connect(self._player._on_ann_copy)
+        ann.paste_req.connect(self._player._on_ann_paste)
+        ann.clear_frame_req.connect(self._player._on_ann_clear_frame)
+        ann.clear_all_req.connect(self._player._on_ann_clear_all)
 
     # ------------------------------------------------------------------ #
     #  Title                                                               #
