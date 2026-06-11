@@ -1492,11 +1492,25 @@ void main() {
             return
         if self._ann_playing and not ann.show_in_playback:
             return
-        strokes = list(ann.strokes.get(self._ann_frame, []))
+
+        current_strokes = list(ann.strokes.get(self._ann_frame, []))
         live = ann.live_stroke()
         if live:
-            strokes = strokes + [live]
-        if not strokes:
+            current_strokes = current_strokes + [live]
+
+        # Collect ghost layers: (strokes, opacity)
+        ghost_layers: list = []
+        if ann.ghost_enabled:
+            for i in range(ann.ghost_before, 0, -1):
+                s = ann.strokes.get(self._ann_frame - i)
+                if s:
+                    ghost_layers.append((list(s), 0.35))
+            for i in range(1, ann.ghost_after + 1):
+                s = ann.strokes.get(self._ann_frame + i)
+                if s:
+                    ghost_layers.append((list(s), 0.35))
+
+        if not current_strokes and not ghost_layers:
             return
 
         vw, vh = self.width(), self.height()
@@ -1513,53 +1527,64 @@ void main() {
         img.fill(Qt.transparent)
         ap = QPainter(img)
         ap.setRenderHint(QPainter.Antialiasing)
-        for stroke in strokes:
-            pts  = stroke["points"]
-            tool = stroke["tool"]
-            if not pts:
-                continue
-            thick = stroke["thickness"]
-            ap.setCompositionMode(
-                QPainter.CompositionMode_Clear if tool == "eraser"
-                else QPainter.CompositionMode_SourceOver
-            )
-            color = Qt.transparent if tool == "eraser" else QColor(stroke["color"])
-            pen   = QPen(color, thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-            ap.setPen(pen)
-            ap.setBrush(Qt.NoBrush)
 
-            if tool in ("pen", "eraser"):
-                if len(pts) == 1:
-                    ap.drawPoint(to_qf(*pts[0]))
+        def _paint_strokes(strokes, opacity: float = 1.0) -> None:
+            for stroke in strokes:
+                pts  = stroke["points"]
+                tool = stroke["tool"]
+                if not pts:
+                    continue
+                thick = stroke["thickness"]
+                if tool == "eraser":
+                    if opacity < 1.0:
+                        continue   # don't cut holes in ghost frames
+                    ap.setCompositionMode(QPainter.CompositionMode_Clear)
+                    color = Qt.transparent
                 else:
-                    for i in range(1, len(pts)):
-                        ap.drawLine(to_qf(*pts[i - 1]), to_qf(*pts[i]))
-            elif tool == "line":
-                if len(pts) >= 2:
-                    ap.drawLine(to_qf(*pts[0]), to_qf(*pts[-1]))
-            elif tool == "arrow":
-                if len(pts) >= 2:
-                    p1 = to_qf(*pts[0])
-                    p2 = to_qf(*pts[-1])
-                    ap.drawLine(p1, p2)
-                    dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
-                    length = math.hypot(dx, dy)
-                    if length > 0:
-                        angle    = math.atan2(dy, dx)
-                        head_len = min(thick * 5 + 12, length * 0.4)
-                        spread   = 0.42   # ~24°
-                        for side in (-spread, spread):
-                            ax = p2.x() - head_len * math.cos(angle + side)
-                            ay = p2.y() - head_len * math.sin(angle + side)
-                            ap.drawLine(p2, QPointF(ax, ay))
-            elif tool == "rect":
-                if len(pts) >= 2:
-                    ap.drawRect(QRectF(to_qf(*pts[0]), to_qf(*pts[-1])))
-            elif tool == "ellipse":
-                if len(pts) >= 2:
-                    ap.drawEllipse(QRectF(to_qf(*pts[0]), to_qf(*pts[-1])))
-        ap.end()
+                    ap.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                    c = QColor(stroke["color"])
+                    if opacity < 1.0:
+                        c.setAlphaF(opacity)
+                    color = c
+                pen = QPen(color, thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                ap.setPen(pen)
+                ap.setBrush(Qt.NoBrush)
+                if tool in ("pen", "eraser"):
+                    if len(pts) == 1:
+                        ap.drawPoint(to_qf(*pts[0]))
+                    else:
+                        for i in range(1, len(pts)):
+                            ap.drawLine(to_qf(*pts[i - 1]), to_qf(*pts[i]))
+                elif tool == "line":
+                    if len(pts) >= 2:
+                        ap.drawLine(to_qf(*pts[0]), to_qf(*pts[-1]))
+                elif tool == "arrow":
+                    if len(pts) >= 2:
+                        p1 = to_qf(*pts[0])
+                        p2 = to_qf(*pts[-1])
+                        ap.drawLine(p1, p2)
+                        dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
+                        length = math.hypot(dx, dy)
+                        if length > 0:
+                            angle    = math.atan2(dy, dx)
+                            head_len = min(thick * 5 + 12, length * 0.4)
+                            spread   = 0.42
+                            for side in (-spread, spread):
+                                ax = p2.x() - head_len * math.cos(angle + side)
+                                ay = p2.y() - head_len * math.sin(angle + side)
+                                ap.drawLine(p2, QPointF(ax, ay))
+                elif tool == "rect":
+                    if len(pts) >= 2:
+                        ap.drawRect(QRectF(to_qf(*pts[0]), to_qf(*pts[-1])))
+                elif tool == "ellipse":
+                    if len(pts) >= 2:
+                        ap.drawEllipse(QRectF(to_qf(*pts[0]), to_qf(*pts[-1])))
 
+        for ghost_strokes, opacity in ghost_layers:
+            _paint_strokes(ghost_strokes, opacity)
+        _paint_strokes(current_strokes)
+
+        ap.end()
         painter = QPainter(self)
         painter.drawImage(0, 0, img)
         painter.end()
@@ -1642,6 +1667,9 @@ class AnnotationLayer:
             "pen": 5, "line": 3, "arrow": 3,
             "rect": 3, "ellipse": 3, "eraser": 24,
         }
+        self.ghost_enabled: bool = False
+        self.ghost_before:  int  = 1   # frames to show before current
+        self.ghost_after:   int  = 1   # frames to show after current
         self._path:            str  = ""
 
     def begin_stroke(self, u: float, v: float) -> None:
@@ -1791,18 +1819,18 @@ class _AnnotationPanel(QWidget):
     def _build_ui(self) -> None:
         self.setStyleSheet(f"background:{constants.BG};")
         root = QVBoxLayout(self)
-        root.setContentsMargins(5, 8, 5, 8)
-        root.setSpacing(4)
+        root.setContentsMargins(3, 5, 3, 5)
+        root.setSpacing(3)
 
         # ── Tool buttons (single column) ──────────────────────────────────
         for tool, icon_file, tip in self._TOOLS:
             btn = _AnnotToolBtn()
             btn.setIcon(_icon(icon_file))
-            btn.setIconSize(QSize(18, 18))
+            btn.setIconSize(QSize(14, 14))
             btn.setCheckable(True)
             btn.setChecked(tool == "pen")
             btn.setFocusPolicy(Qt.NoFocus)
-            btn.setFixedHeight(36)
+            btn.setFixedHeight(26)
             btn.setToolTip(f"{tip}  (right-click to set size)")
             btn.setStyleSheet(self._tool_style(tool == "pen"))
             btn.toggled.connect(lambda checked, t=tool, b=btn: self._on_tool_toggled(t, b, checked))
@@ -1814,7 +1842,7 @@ class _AnnotationPanel(QWidget):
 
         # ── Color swatch ──────────────────────────────────────────────────
         self._color_btn = QPushButton()
-        self._color_btn.setFixedHeight(28)
+        self._color_btn.setFixedHeight(20)
         self._color_btn.setFocusPolicy(Qt.NoFocus)
         self._color_btn.setToolTip("Pen color — click to change")
         self._color_btn.clicked.connect(self._pick_color)
@@ -1832,8 +1860,8 @@ class _AnnotationPanel(QWidget):
         ):
             btn = QPushButton()
             btn.setIcon(_icon(icon_file))
-            btn.setIconSize(QSize(18, 18))
-            btn.setFixedHeight(32)
+            btn.setIconSize(QSize(14, 14))
+            btn.setFixedHeight(26)
             btn.setFocusPolicy(Qt.NoFocus)
             btn.setToolTip(tip)
             btn.setStyleSheet(self._action_style())
@@ -1845,10 +1873,10 @@ class _AnnotationPanel(QWidget):
         # ── Visibility buttons (single column) ────────────────────────────
         self._vis_btn = QPushButton()
         self._vis_btn.setIcon(_icon("show.png"))
-        self._vis_btn.setIconSize(QSize(18, 18))
+        self._vis_btn.setIconSize(QSize(14, 14))
         self._vis_btn.setCheckable(True)
         self._vis_btn.setChecked(True)
-        self._vis_btn.setFixedHeight(32)
+        self._vis_btn.setFixedHeight(26)
         self._vis_btn.setFocusPolicy(Qt.NoFocus)
         self._vis_btn.setToolTip("Show / Hide annotations")
         self._vis_btn.setStyleSheet(self._toggle_style(True))
@@ -1857,15 +1885,29 @@ class _AnnotationPanel(QWidget):
 
         self._pb_btn = QPushButton()
         self._pb_btn.setIcon(_icon("forward.png"))
-        self._pb_btn.setIconSize(QSize(18, 18))
+        self._pb_btn.setIconSize(QSize(14, 14))
         self._pb_btn.setCheckable(True)
         self._pb_btn.setChecked(True)
-        self._pb_btn.setFixedHeight(32)
+        self._pb_btn.setFixedHeight(26)
         self._pb_btn.setFocusPolicy(Qt.NoFocus)
         self._pb_btn.setToolTip("Show annotations during playback")
         self._pb_btn.setStyleSheet(self._toggle_style(True))
         self._pb_btn.toggled.connect(self._on_pb_toggled)
         root.addWidget(self._pb_btn)
+
+        self._ghost_btn = _AnnotToolBtn()
+        self._ghost_btn.setIcon(_icon("ghost.png"))
+        self._ghost_btn.setIconSize(QSize(14, 14))
+        self._ghost_btn.setCheckable(True)
+        self._ghost_btn.setChecked(False)
+        self._ghost_btn.setFixedHeight(26)
+        self._ghost_btn.setFocusPolicy(Qt.NoFocus)
+        self._ghost_btn.setToolTip("Ghost  (right-click to set frame range)")
+        self._ghost_btn.setStyleSheet(self._toggle_style(False))
+        self._ghost_btn.toggled.connect(self._on_ghost_toggled)
+        self._ghost_btn.right_clicked.connect(
+            lambda: self._show_ghost_popup(self._ghost_btn))
+        root.addWidget(self._ghost_btn)
 
         root.addStretch()
 
@@ -2033,6 +2075,57 @@ class _AnnotationPanel(QWidget):
         self._ann.show_in_playback = checked
         self._pb_btn.setStyleSheet(self._toggle_style(checked))
         self.changed.emit()
+
+    def _on_ghost_toggled(self, checked: bool) -> None:
+        self._ann.ghost_enabled = checked
+        self._ghost_btn.setStyleSheet(self._toggle_style(checked))
+        self.changed.emit()
+
+    def _show_ghost_popup(self, btn: _AnnotToolBtn) -> None:
+        popup = QWidget(self, Qt.Popup | Qt.FramelessWindowHint)
+        self._ghost_popup = popup
+        popup.setStyleSheet(
+            f"QWidget{{background:#232323;border:none;border-radius:6px;}}"
+            f"QLabel{{color:{constants.TEXT_PRI};font-size:10px;"
+            f"background:transparent;border:none;}}")
+
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(2)
+
+        for attr, label_text in (("ghost_before", "Before"), ("ghost_after", "After")):
+            current = getattr(self._ann, attr)
+            lbl = QLabel(f"{label_text}: {current}")
+            lbl.setAlignment(Qt.AlignCenter)
+            layout.addWidget(lbl)
+
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 10)
+            slider.setValue(current)
+            slider.setFixedWidth(150)
+            slider.setFocusPolicy(Qt.StrongFocus)
+            slider.setStyleSheet(self._slider_style())
+
+            def _on_change(v: int, a=attr, l=lbl, lt=label_text) -> None:
+                setattr(self._ann, a, v)
+                l.setText(f"{lt}: {v}")
+                self.changed.emit()
+
+            slider.valueChanged.connect(_on_change)
+            layout.addWidget(slider)
+
+        popup.adjustSize()
+        btn_global = btn.mapToGlobal(QPoint(0, 0))
+        pw = popup.width()
+        ph = popup.height()
+        x = btn_global.x() - pw - 4
+        y = btn_global.y()
+        screen = btn.screen().availableGeometry() if hasattr(btn, 'screen') else \
+                 QApplication.primaryScreen().availableGeometry()
+        x = max(screen.left(), min(x, screen.right()  - pw))
+        y = max(screen.top(),  min(y, screen.bottom() - ph))
+        popup.move(x, y)
+        popup.show()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4777,7 +4870,7 @@ class BlastPlayerWindow(QMainWindow):
             Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._ann_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self._ann_dock.setTitleBarWidget(QWidget())
-        self._ann_dock.setFixedWidth(52)
+        self._ann_dock.setFixedWidth(40)
         self._ann_dock.setVisible(False)
         self.addDockWidget(Qt.RightDockWidgetArea, self._ann_dock)
 
