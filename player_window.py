@@ -28,6 +28,7 @@ import sys
 import os
 import re
 import json
+import math
 import time
 import array
 import queue
@@ -43,15 +44,15 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSlider, QSizePolicy,
-    QAction, QFileDialog, QMessageBox,
+    QAction, QFileDialog, QMessageBox, QColorDialog,
     QFrame, QToolButton, QActionGroup, QComboBox, QShortcut,
     QOpenGLWidget, QListWidget, QListWidgetItem, QMenu, QDockWidget,
     QApplication, QLineEdit, QInputDialog, QProgressBar,
     QStyledItemDelegate, QAbstractItemView, QStyle, QSizeGrip,
 )
-from PyQt5.QtCore import Qt, QTimer, QSize, QRect, QThread, pyqtSignal, QSettings, QObject
+from PyQt5.QtCore import Qt, QTimer, QSize, QRect, QRectF, QPointF, QThread, pyqtSignal, QSettings, QObject
 from PyQt5.QtGui import (
-    QKeySequence, QPainter, QPen, QColor,
+    QKeySequence, QPainter, QPen, QColor, QImage,
     QPixmap, QFont, QFontMetrics, QDragEnterEvent, QDropEvent, QIcon,
     QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer,
     QSurfaceFormat, QOpenGLVertexArrayObject,
@@ -1068,6 +1069,12 @@ void main() {
         self._ocio_func_src = ""
         self._ocio_lut_info = []   # list[(sampler_name, tex_id, is_3d)]
 
+        # Annotation overlay
+        self._ann_layer:   "AnnotationLayer | None" = None
+        self._ann_frame:   int  = 0
+        self._ann_drawing: bool = False  # True → mouse captured for pen/eraser
+        self._ann_playing: bool = False  # True → currently in playback
+
     # ── Public API ───────────────────────────────────────────────────── #
 
     def set_frame(self, raw: bytes, vid_w: int, vid_h: int, is_hdr: bool = False):
@@ -1413,6 +1420,150 @@ void main() {
             x0, y0, u0, v1,
         ]
 
+    # ── Annotation API ───────────────────────────────────────────────── #
+
+    def set_annotation_layer(self, layer: "AnnotationLayer") -> None:
+        self._ann_layer = layer
+
+    @property
+    def annotation_drawing(self) -> bool:
+        return self._ann_drawing
+
+    @annotation_drawing.setter
+    def annotation_drawing(self, value: bool) -> None:
+        self._ann_drawing = value
+        self.setCursor(Qt.CrossCursor if value else Qt.ArrowCursor)
+        self.setMouseTracking(value)
+
+    @property
+    def annotation_playing(self) -> bool:
+        return self._ann_playing
+
+    @annotation_playing.setter
+    def annotation_playing(self, value: bool) -> None:
+        if self._ann_playing != value:
+            self._ann_playing = value
+            self.update()
+
+    def _get_uv_state(self):
+        """Return (QRect, u0, v0, u1, v1) for the currently visible video region."""
+        vw, vh = self.width(), self.height()
+        if not self._vid_w or not self._vid_h or not vw or not vh:
+            return QRect(0, 0, max(1, vw), max(1, vh)), 0.0, 0.0, 1.0, 1.0
+        vid_ar  = self._vid_w / self._vid_h
+        view_ar = vw / vh
+        if self._zoom <= 1.0:
+            if vid_ar >= view_ar:
+                sx, sy = 1.0, view_ar / vid_ar
+            else:
+                sx, sy = vid_ar / view_ar, 1.0
+            rw = int(sx * vw)
+            rh = int(sy * vh)
+            rx = (vw - rw) // 2
+            ry = (vh - rh) // 2
+            return QRect(rx, ry, rw, rh), 0.0, 0.0, 1.0, 1.0
+        fit   = (vw / self._vid_w) if vid_ar >= view_ar else (vh / self._vid_h)
+        total = fit * self._zoom
+        disp_w = self._vid_w * total
+        disp_h = self._vid_h * total
+        px = max(0.0, min(float(self._pan_x), max(0.0, disp_w - vw)))
+        py = max(0.0, min(float(self._pan_y), max(0.0, disp_h - vh)))
+        u0 = px / disp_w
+        u1 = min(1.0, (px + vw) / disp_w)
+        v0 = py / disp_h
+        v1 = min(1.0, (py + vh) / disp_h)
+        return QRect(0, 0, vw, vh), u0, v0, u1, v1
+
+    def _canvas_to_uv(self, cx: int, cy: int):
+        rect, u0, v0, u1, v1 = self._get_uv_state()
+        rw, rh = rect.width(), rect.height()
+        if rw <= 0 or rh <= 0:
+            return 0.0, 0.0
+        u = u0 + (cx - rect.x()) / rw * (u1 - u0)
+        v = v0 + (cy - rect.y()) / rh * (v1 - v0)
+        return max(0.0, min(1.0, u)), max(0.0, min(1.0, v))
+
+    # ── paintEvent override (annotation overlay) ─────────────────────── #
+
+    def paintEvent(self, event):
+        super().paintEvent(event)   # runs paintGL → video on screen
+        ann = self._ann_layer
+        if ann is None or not ann.visible:
+            return
+        if self._ann_playing and not ann.show_in_playback:
+            return
+        strokes = list(ann.strokes.get(self._ann_frame, []))
+        live = ann.live_stroke()
+        if live:
+            strokes = strokes + [live]
+        if not strokes:
+            return
+
+        vw, vh = self.width(), self.height()
+        rect, u0, v0, u1, v1 = self._get_uv_state()
+        rw, rh = rect.width(), rect.height()
+        rx, ry = rect.x(), rect.y()
+        du = (u1 - u0) or 1.0
+        dv = (v1 - v0) or 1.0
+
+        def to_qf(u, v):
+            return QPointF(rx + (u - u0) / du * rw, ry + (v - v0) / dv * rh)
+
+        img = QImage(vw, vh, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        ap = QPainter(img)
+        ap.setRenderHint(QPainter.Antialiasing)
+        for stroke in strokes:
+            pts  = stroke["points"]
+            tool = stroke["tool"]
+            if not pts:
+                continue
+            thick = stroke["thickness"]
+            ap.setCompositionMode(
+                QPainter.CompositionMode_Clear if tool == "eraser"
+                else QPainter.CompositionMode_SourceOver
+            )
+            color = Qt.transparent if tool == "eraser" else QColor(stroke["color"])
+            pen   = QPen(color, thick, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            ap.setPen(pen)
+            ap.setBrush(Qt.NoBrush)
+
+            if tool in ("pen", "eraser"):
+                if len(pts) == 1:
+                    ap.drawPoint(to_qf(*pts[0]))
+                else:
+                    for i in range(1, len(pts)):
+                        ap.drawLine(to_qf(*pts[i - 1]), to_qf(*pts[i]))
+            elif tool == "line":
+                if len(pts) >= 2:
+                    ap.drawLine(to_qf(*pts[0]), to_qf(*pts[-1]))
+            elif tool == "arrow":
+                if len(pts) >= 2:
+                    p1 = to_qf(*pts[0])
+                    p2 = to_qf(*pts[-1])
+                    ap.drawLine(p1, p2)
+                    dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
+                    length = math.hypot(dx, dy)
+                    if length > 0:
+                        angle    = math.atan2(dy, dx)
+                        head_len = min(thick * 5 + 12, length * 0.4)
+                        spread   = 0.42   # ~24°
+                        for side in (-spread, spread):
+                            ax = p2.x() - head_len * math.cos(angle + side)
+                            ay = p2.y() - head_len * math.sin(angle + side)
+                            ap.drawLine(p2, QPointF(ax, ay))
+            elif tool == "rect":
+                if len(pts) >= 2:
+                    ap.drawRect(QRectF(to_qf(*pts[0]), to_qf(*pts[-1])))
+            elif tool == "ellipse":
+                if len(pts) >= 2:
+                    ap.drawEllipse(QRectF(to_qf(*pts[0]), to_qf(*pts[-1])))
+        ap.end()
+
+        painter = QPainter(self)
+        painter.drawImage(0, 0, img)
+        painter.end()
+
     # ── Mouse / wheel ────────────────────────────────────────────────── #
 
     def wheelEvent(self, event):
@@ -1420,6 +1571,12 @@ void main() {
         event.accept()
 
     def mousePressEvent(self, event):
+        if self._ann_drawing and event.button() == Qt.LeftButton:
+            if self._ann_layer:
+                self._ann_layer.begin_stroke(*self._canvas_to_uv(event.x(), event.y()))
+                self.update()
+            event.accept()
+            return
         if event.button() == Qt.MiddleButton:
             self._drag_pos = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
@@ -1427,6 +1584,12 @@ void main() {
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._ann_drawing and (event.buttons() & Qt.LeftButton):
+            if self._ann_layer:
+                self._ann_layer.extend_stroke(*self._canvas_to_uv(event.x(), event.y()))
+                self.update()
+            event.accept()
+            return
         if event.buttons() & Qt.MiddleButton and self._drag_pos is not None:
             d = event.pos() - self._drag_pos
             self._drag_pos = event.pos()
@@ -1435,9 +1598,15 @@ void main() {
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._ann_drawing and event.button() == Qt.LeftButton:
+            if self._ann_layer:
+                self._ann_layer.end_stroke(self._ann_frame)
+                self.update()
+            event.accept()
+            return
         if event.button() == Qt.MiddleButton:
             self._drag_pos = None
-            self.setCursor(Qt.ArrowCursor)
+            self.setCursor(Qt.CrossCursor if self._ann_drawing else Qt.ArrowCursor)
         else:
             super().mouseReleaseEvent(event)
 
@@ -1449,6 +1618,392 @@ void main() {
                 parent.mouseDoubleClickEvent(event)
         else:
             super().mouseDoubleClickEvent(event)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Annotation data model
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AnnotationLayer:
+    """Per-frame freehand strokes, persisted as a JSON sidecar next to the video."""
+
+    COLORS = ["#ff4444", "#ffdd00", "#ffffff", "#00ddff", "#44ff88"]
+    THICKNESSES = [2, 5, 12]
+
+    def __init__(self):
+        self.strokes:          dict = {}    # int → [stroke_dict, ...]
+        self._redo:            dict = {}    # int → [stroke_dict, ...] (transient)
+        self._in_progress:     dict | None = None
+        self.visible:          bool = True
+        self.show_in_playback: bool = True
+        self.active_tool:      str  = "pen"
+        self.pen_color:        str  = "#ff4444"
+        self.pen_thickness:    int  = 5
+        self.eraser_thickness: int  = 24
+        self._path:            str  = ""
+
+    def begin_stroke(self, u: float, v: float) -> None:
+        t = self.pen_thickness if self.active_tool == "pen" else self.eraser_thickness
+        self._in_progress = {
+            "tool": self.active_tool, "color": self.pen_color,
+            "thickness": t, "points": [(u, v)],
+        }
+
+    def extend_stroke(self, u: float, v: float) -> None:
+        if not self._in_progress:
+            return
+        tool = self._in_progress["tool"]
+        pts  = self._in_progress["points"]
+        if tool in ("pen", "eraser"):
+            pts.append((u, v))
+        else:
+            # Shape tools — keep only [start, current] so live preview is cheap
+            if len(pts) < 2:
+                pts.append((u, v))
+            else:
+                pts[1] = (u, v)
+
+    def end_stroke(self, frame: int) -> None:
+        s = self._in_progress
+        if s and s["points"]:
+            self.strokes.setdefault(frame, []).append(s)
+            self._redo.pop(frame, None)   # new stroke invalidates redo history
+            self._save()
+        self._in_progress = None
+
+    def cancel_stroke(self) -> None:
+        self._in_progress = None
+
+    def live_stroke(self) -> dict | None:
+        return self._in_progress
+
+    def undo_stroke(self, frame: int) -> None:
+        strokes = self.strokes.get(frame)
+        if strokes:
+            self._redo.setdefault(frame, []).append(strokes.pop())
+            if not strokes:
+                self.strokes.pop(frame, None)
+            self._save()
+
+    def redo_stroke(self, frame: int) -> None:
+        redo = self._redo.get(frame)
+        if redo:
+            self.strokes.setdefault(frame, []).append(redo.pop())
+            if not redo:
+                self._redo.pop(frame, None)
+            self._save()
+
+    def clear_frame(self, frame: int) -> None:
+        self.strokes.pop(frame, None)
+        self._redo.pop(frame, None)
+        self._save()
+
+    def clear_all(self) -> None:
+        self.strokes.clear()
+        self._redo.clear()
+        self._save()
+
+    def set_video_path(self, path: str) -> None:
+        self.strokes.clear()
+        self._redo.clear()
+        self._in_progress = None
+        self._path = path
+        if path:
+            self._load()
+
+    def _sidecar(self) -> str:
+        return (self._path + ".annotations.json") if self._path else ""
+
+    def _save(self) -> None:
+        p = self._sidecar()
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in self.strokes.items()}, f,
+                          separators=(",", ":"))
+        except Exception:
+            pass
+
+    def _load(self) -> None:
+        p = self._sidecar()
+        if not p or not Path(p).exists():
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            self.strokes = {int(k): v for k, v in data.items()}
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Annotation panel (dockable vertical sidebar)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _AnnotationPanel(QWidget):
+    """Compact icon-only vertical annotation sidebar — hosted in a QDockWidget."""
+
+    changed         = pyqtSignal()
+    undo_req        = pyqtSignal()
+    redo_req        = pyqtSignal()
+    clear_frame_req = pyqtSignal()
+    clear_all_req   = pyqtSignal()
+
+    # (tool_name, icon_filename, tooltip)
+    _TOOLS = [
+        ("pen",     "pen.png",         "Freehand Pen"),
+        ("line",    "remove.png",      "Straight Line"),
+        ("arrow",   "right-arrow.png", "Arrow"),
+        ("ellipse", "rec.png",         "Ellipse"),
+        ("rect",    "stop.png",        "Rectangle"),
+        ("eraser",  "eraser.png",      "Eraser"),
+    ]
+
+    def __init__(self, ann: "AnnotationLayer", parent=None):
+        super().__init__(parent)
+        self._ann       = ann
+        self._tool_btns: dict[str, QPushButton] = {}
+        self._build_ui()
+
+    # ── Build ─────────────────────────────────────────────────────────── #
+
+    def _build_ui(self) -> None:
+        self.setStyleSheet(f"background:{constants.BG};")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(5, 8, 5, 8)
+        root.setSpacing(4)
+
+        # ── Tool buttons (single column) ──────────────────────────────────
+        for tool, icon_file, tip in self._TOOLS:
+            btn = QPushButton()
+            btn.setIcon(_icon(icon_file))
+            btn.setIconSize(QSize(18, 18))
+            btn.setCheckable(True)
+            btn.setChecked(tool == "pen")
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setFixedHeight(36)
+            btn.setToolTip(tip)
+            btn.setStyleSheet(self._tool_style(tool == "pen"))
+            btn.toggled.connect(lambda checked, t=tool, b=btn: self._on_tool_toggled(t, b, checked))
+            self._tool_btns[tool] = btn
+            root.addWidget(btn)
+
+        root.addWidget(self._sep_h())
+
+        # ── Color swatch ──────────────────────────────────────────────────
+        self._color_btn = QPushButton()
+        self._color_btn.setFixedHeight(28)
+        self._color_btn.setFocusPolicy(Qt.NoFocus)
+        self._color_btn.setToolTip("Pen color — click to change")
+        self._color_btn.clicked.connect(self._pick_color)
+        root.addWidget(self._color_btn)
+        self._refresh_color_btn()
+
+        root.addWidget(self._sep_h())
+
+        # ── Pen size ──────────────────────────────────────────────────────
+        self._pen_size_lbl = QLabel(f"Pen  {self._ann.pen_thickness}")
+        self._pen_size_lbl.setAlignment(Qt.AlignCenter)
+        self._pen_size_lbl.setStyleSheet(
+            f"color:{constants.TEXT_SEC};font-size:9px;background:transparent;")
+        root.addWidget(self._pen_size_lbl)
+
+        self._pen_slider = QSlider(Qt.Horizontal)
+        self._pen_slider.setRange(1, 50)
+        self._pen_slider.setValue(self._ann.pen_thickness)
+        self._pen_slider.setFocusPolicy(Qt.NoFocus)
+        self._pen_slider.setStyleSheet(self._slider_style())
+        self._pen_slider.valueChanged.connect(self._on_pen_size)
+        root.addWidget(self._pen_slider)
+
+        # ── Eraser size ───────────────────────────────────────────────────
+        self._eraser_size_lbl = QLabel(f"Eraser  {self._ann.eraser_thickness}")
+        self._eraser_size_lbl.setAlignment(Qt.AlignCenter)
+        self._eraser_size_lbl.setStyleSheet(
+            f"color:{constants.TEXT_SEC};font-size:9px;background:transparent;")
+        root.addWidget(self._eraser_size_lbl)
+
+        self._eraser_slider = QSlider(Qt.Horizontal)
+        self._eraser_slider.setRange(4, 100)
+        self._eraser_slider.setValue(self._ann.eraser_thickness)
+        self._eraser_slider.setFocusPolicy(Qt.NoFocus)
+        self._eraser_slider.setStyleSheet(self._slider_style())
+        self._eraser_slider.valueChanged.connect(self._on_eraser_size)
+        root.addWidget(self._eraser_slider)
+
+        root.addWidget(self._sep_h())
+
+        # ── Action buttons (single column) ────────────────────────────────
+        for icon_file, tip, sig in (
+            ("undo.png",   "Undo last stroke",  self.undo_req),
+            ("redo.png",   "Redo last stroke",  self.redo_req),
+            ("delete.png", "Clear this frame",  self.clear_frame_req),
+            ("bin.png",    "Clear all frames",  self.clear_all_req),
+        ):
+            btn = QPushButton()
+            btn.setIcon(_icon(icon_file))
+            btn.setIconSize(QSize(18, 18))
+            btn.setFixedHeight(32)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setToolTip(tip)
+            btn.setStyleSheet(self._action_style())
+            btn.clicked.connect(sig)
+            root.addWidget(btn)
+
+        root.addWidget(self._sep_h())
+
+        # ── Visibility buttons (single column) ────────────────────────────
+        self._vis_btn = QPushButton()
+        self._vis_btn.setIcon(_icon("show.png"))
+        self._vis_btn.setIconSize(QSize(18, 18))
+        self._vis_btn.setCheckable(True)
+        self._vis_btn.setChecked(True)
+        self._vis_btn.setFixedHeight(32)
+        self._vis_btn.setFocusPolicy(Qt.NoFocus)
+        self._vis_btn.setToolTip("Show / Hide annotations")
+        self._vis_btn.setStyleSheet(self._toggle_style(True))
+        self._vis_btn.toggled.connect(self._on_vis_toggled)
+        root.addWidget(self._vis_btn)
+
+        self._pb_btn = QPushButton()
+        self._pb_btn.setIcon(_icon("forward.png"))
+        self._pb_btn.setIconSize(QSize(18, 18))
+        self._pb_btn.setCheckable(True)
+        self._pb_btn.setChecked(True)
+        self._pb_btn.setFixedHeight(32)
+        self._pb_btn.setFocusPolicy(Qt.NoFocus)
+        self._pb_btn.setToolTip("Show annotations during playback")
+        self._pb_btn.setStyleSheet(self._toggle_style(True))
+        self._pb_btn.toggled.connect(self._on_pb_toggled)
+        root.addWidget(self._pb_btn)
+
+        root.addStretch()
+
+    # ── Styling helpers ───────────────────────────────────────────────── #
+
+    @staticmethod
+    def _icon_font() -> QFont:
+        f = QFont()
+        f.setPointSize(14)
+        return f
+
+    @staticmethod
+    def _tool_style(active: bool) -> str:
+        bg     = "#4a4a6a" if active else "#2a2a2a"
+        border = f"2px solid {constants.ACCENT_HI}" if active else "2px solid #3a3a3a"
+        return (
+            f"QPushButton{{background:{bg};color:{constants.TEXT_PRI};"
+            f"border:{border};border-radius:6px;font-size:16px;}}"
+            f"QPushButton:hover{{background:#3a3a5a;border:2px solid {constants.ACCENT_HI};}}"
+            f"QPushButton:checked{{background:#4a4a6a;border:2px solid {constants.ACCENT_HI};}}"
+        )
+
+    @staticmethod
+    def _action_style() -> str:
+        return (
+            f"QPushButton{{background:#2a2a2a;color:{constants.TEXT_SEC};"
+            f"border:2px solid #3a3a3a;border-radius:6px;font-size:14px;}}"
+            f"QPushButton:hover{{background:#3a3a3a;color:{constants.TEXT_PRI};"
+            f"border:2px solid #555;}}"
+        )
+
+    @staticmethod
+    def _toggle_style(active: bool) -> str:
+        bg     = "#2a4a2a" if active else "#2a2a2a"
+        border = "2px solid #4a8a4a" if active else "2px solid #3a3a3a"
+        return (
+            f"QPushButton{{background:{bg};color:{constants.TEXT_PRI};"
+            f"border:{border};border-radius:6px;font-size:14px;}}"
+            f"QPushButton:hover{{background:#3a5a3a;border:2px solid #5aaa5a;}}"
+            f"QPushButton:checked{{background:#2a4a2a;border:2px solid #4a8a4a;}}"
+        )
+
+    @staticmethod
+    def _sep_h() -> QFrame:
+        f = QFrame()
+        f.setFrameShape(QFrame.HLine)
+        f.setFixedHeight(1)
+        f.setStyleSheet("background:#333;border:none;")
+        return f
+
+    @staticmethod
+    def _slider_style() -> str:
+        return f"""
+            QSlider::groove:horizontal{{background:#333;height:4px;border-radius:2px;}}
+            QSlider::handle:horizontal{{
+                background:{constants.TEXT_PRI};
+                width:12px;height:12px;border-radius:6px;margin:-4px 0;
+            }}
+            QSlider::handle:horizontal:hover{{background:{constants.ACCENT_HI};}}
+            QSlider::sub-page:horizontal{{background:{constants.ACCENT_HI};border-radius:2px;}}
+        """
+
+    # ── Color ─────────────────────────────────────────────────────────── #
+
+    def _refresh_color_btn(self) -> None:
+        c = self._ann.pen_color
+        self._color_btn.setStyleSheet(
+            f"QPushButton{{background:{c};border:2px solid #555;border-radius:6px;}}"
+            f"QPushButton:hover{{border:2px solid {constants.TEXT_PRI};}}"
+        )
+
+    def _pick_color(self) -> None:
+        color = QColorDialog.getColor(QColor(self._ann.pen_color), self, "Pen Color")
+        if color.isValid():
+            self._ann.pen_color = color.name()
+            self._refresh_color_btn()
+            # Auto-switch to pen when color changes
+            if self._ann.active_tool not in ("pen", "line", "arrow", "rect", "ellipse"):
+                self._tool_btns["pen"].setChecked(True)
+            self.changed.emit()
+
+    # ── Tool toggle ───────────────────────────────────────────────────── #
+
+    def _on_tool_toggled(self, tool: str, btn: QPushButton, checked: bool) -> None:
+        if checked:
+            self._ann.active_tool = tool
+            btn.setStyleSheet(self._tool_style(True))
+            # Uncheck all others
+            for t, b in self._tool_btns.items():
+                if t != tool and b.isChecked():
+                    b.blockSignals(True)
+                    b.setChecked(False)
+                    b.setStyleSheet(self._tool_style(False))
+                    b.blockSignals(False)
+        else:
+            # Don't allow deselecting unless another tool is checked
+            any_checked = any(b.isChecked() for b in self._tool_btns.values())
+            if not any_checked:
+                btn.blockSignals(True)
+                btn.setChecked(True)
+                btn.blockSignals(False)
+            btn.setStyleSheet(self._tool_style(btn.isChecked()))
+
+    # ── Size slots ────────────────────────────────────────────────────── #
+
+    def _on_pen_size(self, value: int) -> None:
+        self._ann.pen_thickness = value
+        self._pen_size_lbl.setText(f"Pen  {value}")
+        self.changed.emit()
+
+    def _on_eraser_size(self, value: int) -> None:
+        self._ann.eraser_thickness = value
+        self._eraser_size_lbl.setText(f"Eraser  {value}")
+        self.changed.emit()
+
+    # ── Visibility slots ──────────────────────────────────────────────── #
+
+    def _on_vis_toggled(self, checked: bool) -> None:
+        self._ann.visible = checked
+        self._vis_btn.setIcon(_icon("show.png" if checked else "hidden.png"))
+        self._vis_btn.setStyleSheet(self._toggle_style(checked))
+        self.changed.emit()
+
+    def _on_pb_toggled(self, checked: bool) -> None:
+        self._ann.show_in_playback = checked
+        self._pb_btn.setStyleSheet(self._toggle_style(checked))
+        self.changed.emit()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1605,6 +2160,9 @@ class PlayerWidget(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
 
+        # Annotation state
+        self._annotations = AnnotationLayer()
+
         self._build_ui()
 
     # ------------------------------------------------------------------ #
@@ -1640,6 +2198,9 @@ class PlayerWidget(QWidget):
         self._scrubber.set_in_out(None, None)
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
+        self._annotations.set_video_path(path)
+        self._canvas._ann_frame = 0
+
         self._show_frame(0)
         self._update_info()
         self.audio_loading.emit(True)
@@ -2633,6 +3194,8 @@ class PlayerWidget(QWidget):
 
         root.addWidget(self._canvas, stretch=1)
 
+        self._canvas.set_annotation_layer(self._annotations)
+
         # ── Timeline strip ────────────────────────────────────────────────
         timeline = QWidget()
         self._timeline_widget = timeline
@@ -2710,6 +3273,21 @@ class PlayerWidget(QWidget):
         self._playlist_btn.setStyleSheet(self._loop_style(False))
         self._playlist_btn.toggled.connect(self._toggle_playlist)
         tr.addWidget(self._playlist_btn)
+
+        self._ann_btn = QPushButton()
+        ic_ann = _icon("edit.png")
+        if not ic_ann.isNull():
+            self._ann_btn.setIcon(ic_ann)
+            self._ann_btn.setIconSize(QSize(14, 14))
+        else:
+            self._ann_btn.setText("✏")
+        self._ann_btn.setCheckable(True)
+        self._ann_btn.setFixedSize(28, 28)
+        self._ann_btn.setFocusPolicy(Qt.NoFocus)
+        self._ann_btn.setToolTip("Annotations  (Ctrl+Shift+A)")
+        self._ann_btn.setStyleSheet(self._loop_style(False))
+        self._ann_btn.toggled.connect(self._toggle_annotation_toolbar)
+        tr.addWidget(self._ann_btn)
         tr.addSpacing(6)
 
         tr.addStretch(1)
@@ -2883,6 +3461,7 @@ class PlayerWidget(QWidget):
 
         interval = max(1, int(1000 / (self._fps * self._speed)))
         self._timer.start(interval)
+        self._canvas.annotation_playing = True
 
     def _pause(self):
         self._is_playing   = False
@@ -2893,6 +3472,7 @@ class PlayerWidget(QWidget):
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._audio.stop()
+        self._canvas.annotation_playing = False
         self._show_frame(self._current_frame)
 
     def _on_tick(self):
@@ -3236,6 +3816,7 @@ class PlayerWidget(QWidget):
         w, h = self._effective_size()
         if not w or not h:
             return
+        self._canvas._ann_frame = self._current_frame
         if self._gpu_cache_ready:
             tex = self._canvas.get_cached_tex(self._current_frame)
             if tex is not None:
@@ -3500,6 +4081,43 @@ class PlayerWidget(QWidget):
         # Dock visibility is managed by BlastPlayerWindow; just sync the style.
         self._playlist_btn.setStyleSheet(self._loop_style(checked))
 
+    # ------------------------------------------------------------------ #
+    #  Annotations                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _toggle_annotation_toolbar(self, checked: bool) -> None:
+        self._ann_btn.setStyleSheet(self._loop_style(checked))
+        self._canvas.annotation_drawing = checked
+        if not checked and self._annotations._in_progress:
+            self._annotations.cancel_stroke()
+            self._canvas.update()
+
+    def _on_ann_undo(self) -> None:
+        self._annotations.undo_stroke(self._current_frame)
+        self._canvas.update()
+
+    def _on_ann_redo(self) -> None:
+        self._annotations.redo_stroke(self._current_frame)
+        self._canvas.update()
+
+    def _on_ann_clear_frame(self) -> None:
+        self._annotations.clear_frame(self._current_frame)
+        self._canvas.update()
+
+    def _on_ann_clear_all(self) -> None:
+        self._annotations.clear_all()
+        self._canvas.update()
+
+    def _ann_toggle_visibility(self) -> None:
+        """Toggle annotation visibility from the Annotation menu."""
+        self._annotations.visible = not self._annotations.visible
+        self._canvas.update()
+
+    def _ann_toggle_playback(self) -> None:
+        """Toggle show-during-playback from the Annotation menu."""
+        self._annotations.show_in_playback = not self._annotations.show_in_playback
+        self._canvas.update()
+
     def _on_playlist_select(self, path: str):
         from pathlib import Path as _P
         if _P(path).is_file():
@@ -3625,6 +4243,8 @@ class PlayerWidget(QWidget):
         else:
             self._frames_lbl.setText(f"{self._total_frames} frames")
         self._fps_lbl.setText(f"{self._fps:.2f} fps")
+        # Sync annotation frame — called after _current_frame is finalized each tick
+        self._canvas._ann_frame = f
         if hasattr(self, '_on_frame_changed'):
             self._on_frame_changed(global_f + 1)
 
@@ -3725,10 +4345,12 @@ class PlayerWidget(QWidget):
         mods = event.modifiers()
         ctrl = mods & Qt.ControlModifier
 
+        shift = mods & Qt.ShiftModifier
         if   k == Qt.Key_Space:                  self._toggle_play()
         elif k == Qt.Key_L:                      self._play(reverse=False)
         elif k == Qt.Key_J:                      self._play(reverse=True)
         elif k == Qt.Key_K:                      self._pause()
+        elif k == Qt.Key_A and ctrl and shift:   self._ann_btn.setChecked(not self._ann_btn.isChecked())
         elif k == Qt.Key_Left  and not ctrl:     self._step_back()
         elif k == Qt.Key_Right and not ctrl:     self._step_forward()
         elif k == Qt.Key_Home:                   self._go_first()
@@ -3754,6 +4376,8 @@ class PlayerWidget(QWidget):
         self._close_scrub_pipe()
         self._close_window()
         self._audio.stop()
+        self._annotations.set_video_path("")
+        self._canvas._ann_frame = 0
         self._path             = ""
         self._current_frame    = 0
         self._is_playing       = False
@@ -4063,6 +4687,7 @@ class BlastPlayerWindow(QMainWindow):
         self._build_menu()
         self._setup_shortcuts()
         self._build_playlist_dock()
+        self._build_annotation_dock()
         self._build_fullscreen_timer()
         self._restore_geometry()
         self._restore_settings()
@@ -4105,6 +4730,39 @@ class BlastPlayerWindow(QMainWindow):
 
     def _on_playlist_video_selected(self, path: str):
         self.open_video(path)
+
+    # ------------------------------------------------------------------ #
+    #  Annotation dock                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _build_annotation_dock(self):
+        self._ann_panel = _AnnotationPanel(self._player._annotations)
+
+        self._ann_dock = QDockWidget(self)
+        self._ann_dock.setObjectName("AnnotationDock")
+        self._ann_dock.setWidget(self._ann_panel)
+        self._ann_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self._ann_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self._ann_dock.setTitleBarWidget(QWidget())
+        self._ann_dock.setMinimumWidth(64)
+        self._ann_dock.setMaximumWidth(120)
+        self._ann_dock.setVisible(False)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._ann_dock)
+
+        # Sync toggle button ↔ dock visibility
+        self._player._ann_btn.toggled.connect(self._ann_dock.setVisible)
+        self._ann_dock.visibilityChanged.connect(self._player._ann_btn.setChecked)
+        self._ann_dock.visibilityChanged.connect(
+            self._player._toggle_annotation_toolbar)
+
+        # Panel signals → canvas repaint / player actions / menu sync
+        self._ann_panel.changed.connect(self._player._canvas.update)
+        self._ann_panel.changed.connect(self._sync_ann_menu_state)
+        self._ann_panel.undo_req.connect(self._player._on_ann_undo)
+        self._ann_panel.redo_req.connect(self._player._on_ann_redo)
+        self._ann_panel.clear_frame_req.connect(self._player._on_ann_clear_frame)
+        self._ann_panel.clear_all_req.connect(self._player._on_ann_clear_all)
 
     # ------------------------------------------------------------------ #
     #  Title                                                               #
@@ -4259,11 +4917,27 @@ class BlastPlayerWindow(QMainWindow):
         vm.addAction("Flip Vertical").setShortcut("Ctrl+Shift+X")
         vm.actions()[-1].triggered.connect(self._player.flip_vertical)
 
-        # Bookmarks
-        bm = mb.addMenu("Bookmarks")
-        bm.addAction("Add Bookmark").setShortcut("Ctrl+B")
-        bm.addAction("Next Bookmark").setShortcut("Shift+Right")
-        bm.addAction("Previous Bookmark").setShortcut("Shift+Left")
+        # Annotations
+        am = mb.addMenu("Annotations")
+        ann_toggle = am.addAction("Toggle Annotation Toolbar")
+        ann_toggle.setShortcut("Ctrl+Shift+A")
+        ann_toggle.triggered.connect(
+            lambda: self._player._ann_btn.setChecked(not self._player._ann_btn.isChecked())
+        )
+        am.addSeparator()
+        self._ann_vis_act = am.addAction("Show Annotations")
+        self._ann_vis_act.setCheckable(True)
+        self._ann_vis_act.setChecked(True)
+        self._ann_vis_act.triggered.connect(self._on_ann_vis_toggled)
+        self._ann_pb_act = am.addAction("Show During Playback")
+        self._ann_pb_act.setCheckable(True)
+        self._ann_pb_act.setChecked(True)
+        self._ann_pb_act.triggered.connect(self._on_ann_pb_toggled)
+        am.addSeparator()
+        am.addAction("Clear Frame Annotations").triggered.connect(
+            self._player._on_ann_clear_frame)
+        am.addAction("Clear All Annotations").triggered.connect(
+            self._player._on_ann_clear_all)
 
         # Tools
         tm = mb.addMenu("Tools")
@@ -4438,6 +5112,35 @@ class BlastPlayerWindow(QMainWindow):
             self._exit_fullscreen()
         else:
             super().keyPressEvent(event)
+
+    def _on_ann_vis_toggled(self, checked: bool) -> None:
+        ann = self._player._annotations
+        ann.visible = checked
+        if hasattr(self, '_ann_panel'):
+            btn = self._ann_panel._vis_btn
+            btn.blockSignals(True)
+            btn.setChecked(checked)
+            btn.setIcon(_icon("show.png" if checked else "hidden.png"))
+            btn.setStyleSheet(self._ann_panel._toggle_style(checked))
+            btn.blockSignals(False)
+        self._player._canvas.update()
+
+    def _on_ann_pb_toggled(self, checked: bool) -> None:
+        ann = self._player._annotations
+        ann.show_in_playback = checked
+        if hasattr(self, '_ann_panel'):
+            self._ann_panel._pb_btn.blockSignals(True)
+            self._ann_panel._pb_btn.setChecked(checked)
+            self._ann_panel._pb_btn.setStyleSheet(
+                self._ann_panel._toggle_style(checked))
+            self._ann_panel._pb_btn.blockSignals(False)
+        self._player._canvas.update()
+
+    def _sync_ann_menu_state(self) -> None:
+        """Keep Annotation menu checkmarks in sync after panel controls change."""
+        ann = self._player._annotations
+        self._ann_vis_act.setChecked(ann.visible)
+        self._ann_pb_act.setChecked(ann.show_in_playback)
 
     def _on_about(self):
         try:
