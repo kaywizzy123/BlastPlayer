@@ -39,6 +39,7 @@ import ctypes
 from pathlib import Path
 
 from core.audio_engine import AudioEngine
+from core.session     import SessionServer, SessionClient
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QStackedWidget,
@@ -2387,6 +2388,12 @@ class PlayerWidget(QWidget):
         self._annotations = AnnotationLayer()
         self._ann_panel   = _AnnotationPanel(self._annotations)
 
+        # Session sync
+        self._session_server:    SessionServer | None = None
+        self._session_client:    SessionClient | None = None
+        self._session_follower:  bool = False   # True → we receive, not broadcast
+        self._session_applying:  bool = False   # guard against re-broadcast loops
+
         self._build_ui()
 
     # ------------------------------------------------------------------ #
@@ -3433,6 +3440,7 @@ class PlayerWidget(QWidget):
         self._canvas.zoom_scrolled.connect(self._on_zoom_scroll)
         self._canvas.pan_dragged.connect(self._on_pan_drag)
         self._canvas.stroke_committed.connect(self._refresh_ann_markers)
+        self._canvas.stroke_committed.connect(self._on_stroke_committed_broadcast)
 
         root.addWidget(self._canvas, stretch=1)
 
@@ -3624,6 +3632,15 @@ class PlayerWidget(QWidget):
         )
         right_layout.addWidget(self._vol_lbl)
 
+        self._session_lbl = QLabel("")
+        self._session_lbl.setAlignment(Qt.AlignVCenter)
+        self._session_lbl.setStyleSheet(
+            "color: #4CAF50; font-size: 10px; font-weight: bold; background: transparent;"
+        )
+        self._session_lbl.setVisible(False)
+        right_layout.addSpacing(8)
+        right_layout.addWidget(self._session_lbl)
+
         tr.addWidget(right, stretch=1)
         root.addWidget(transport)
 
@@ -3704,6 +3721,9 @@ class PlayerWidget(QWidget):
         interval = max(1, int(1000 / (self._fps * self._speed)))
         self._timer.start(interval)
         self._canvas.annotation_playing = True
+        if not self._session_applying:
+            self._session_broadcast(
+                {"type": "play", "frame": self._mc_offset() + self._current_frame})
 
     def _pause(self):
         self._is_playing   = False
@@ -3716,6 +3736,9 @@ class PlayerWidget(QWidget):
         self._audio.stop()
         self._canvas.annotation_playing = False
         self._show_frame(self._current_frame)
+        if not self._session_applying:
+            self._session_broadcast(
+                {"type": "pause", "frame": self._mc_offset() + self._current_frame})
 
     def _on_tick(self):
         if not self._path:
@@ -4099,6 +4122,8 @@ class PlayerWidget(QWidget):
     def _on_scrubber_released(self):
         self._scrubber_moving = False
         global_val = self._scrubber.value()
+        if not self._session_applying:
+            self._session_broadcast({"type": "seek", "frame": global_val})
 
         if self._mc_idx >= 0 and self._mc_clips:
             local_frame, target_idx = self._global_to_local(global_val)
@@ -4350,14 +4375,17 @@ class PlayerWidget(QWidget):
         self._refresh_ann_markers()
 
     def _on_ann_clear_frame(self) -> None:
-        self._annotations.clear_frame(self._ann_frame())
+        f = self._ann_frame()
+        self._annotations.clear_frame(f)
         self._canvas.update()
         self._refresh_ann_markers()
+        self._session_broadcast({"type": "clear_frame", "frame": f})
 
     def _on_ann_clear_all(self) -> None:
         self._annotations.clear_all()
         self._canvas.update()
         self._refresh_ann_markers()
+        self._session_broadcast({"type": "clear_all"})
 
     def _refresh_ann_markers(self) -> None:
         self._scrubber.set_annotation_frames(set(self._annotations.strokes.keys()))
@@ -4420,6 +4448,132 @@ class PlayerWidget(QWidget):
             ann._load()
         self._refresh_ann_markers()
         self._canvas.update()
+
+    # ------------------------------------------------------------------ #
+    #  Session sync                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _session_broadcast(self, msg: dict) -> None:
+        """Send a message to all followers (host only, no-op when following)."""
+        if self._session_server and not self._session_follower:
+            self._session_server.broadcast(msg)
+
+    def _on_stroke_committed_broadcast(self) -> None:
+        if self._session_applying:
+            return
+        frame = self._ann_frame()
+        strokes = self._annotations.strokes.get(frame)
+        if strokes:
+            self._session_broadcast(
+                {"type": "stroke", "frame": frame, "stroke": strokes[-1]})
+
+    def _session_update_label(self) -> None:
+        if self._session_server:
+            n = self._session_server.client_count
+            viewers = f"{n} viewer{'s' if n != 1 else ''}"
+            self._session_lbl.setText(f"● HOSTING  {viewers}")
+            self._session_lbl.setStyleSheet(
+                "color:#4CAF50;font-size:10px;font-weight:bold;background:transparent;")
+            self._session_lbl.setVisible(True)
+        elif self._session_client and self._session_follower:
+            self._session_lbl.setText("● LIVE")
+            self._session_lbl.setStyleSheet(
+                f"color:{constants.ACCENT_HI};font-size:10px;font-weight:bold;background:transparent;")
+            self._session_lbl.setVisible(True)
+        else:
+            self._session_lbl.setVisible(False)
+
+    def start_hosting(self, port: int = SessionServer.DEFAULT_PORT) -> bool:
+        self.stop_session()
+        self._session_server = SessionServer(self)
+        if not self._session_server.start(port):
+            self._session_server = None
+            return False
+        self._session_server.client_joined.connect(
+            lambda _: self._session_update_label())
+        self._session_server.client_left.connect(
+            lambda _: self._session_update_label())
+        self._session_follower = False
+        self._session_update_label()
+        return True
+
+    def start_following(self, host: str,
+                        port: int = SessionServer.DEFAULT_PORT) -> bool:
+        self.stop_session()
+        self._session_client = SessionClient(self)
+        self._session_client.seek_received.connect(self._on_session_seek)
+        self._session_client.play_received.connect(self._on_session_play)
+        self._session_client.pause_received.connect(self._on_session_pause)
+        self._session_client.stroke_received.connect(self._on_session_stroke)
+        self._session_client.clear_received.connect(self._on_session_clear_frame)
+        self._session_client.clear_all_received.connect(self._on_session_clear_all)
+        self._session_client.disconnected.connect(self._on_session_disconnected)
+        if not self._session_client.connect_to(host, port):
+            self._session_client = None
+            return False
+        self._session_follower = True
+        self._session_update_label()
+        return True
+
+    def stop_session(self) -> None:
+        if self._session_server:
+            self._session_server.stop()
+            self._session_server = None
+        if self._session_client:
+            self._session_client.disconnect()
+            self._session_client = None
+        self._session_follower = False
+        self._session_update_label()
+
+    # ── Receive handlers (followers) ─────────────────────────────────── #
+
+    def _on_session_seek(self, global_frame: int) -> None:
+        if not self._path:
+            return
+        self._session_applying = True
+        self._scrubber.setValue(global_frame)
+        self._on_scrubber_released()
+        self._session_applying = False
+
+    def _on_session_play(self, global_frame: int) -> None:
+        if not self._path:
+            return
+        self._session_applying = True
+        self._scrubber.setValue(global_frame)
+        self._on_scrubber_released()
+        if not self._is_playing:
+            self._on_play_pause()
+        self._session_applying = False
+
+    def _on_session_pause(self, global_frame: int) -> None:
+        if not self._path:
+            return
+        self._session_applying = True
+        if self._is_playing:
+            self._on_play_pause()
+        self._scrubber.setValue(global_frame)
+        self._on_scrubber_released()
+        self._session_applying = False
+
+    def _on_session_stroke(self, frame: int, stroke: dict) -> None:
+        self._annotations.strokes.setdefault(frame, []).append(stroke)
+        self._refresh_ann_markers()
+        self._canvas.update()
+
+    def _on_session_clear_frame(self, frame: int) -> None:
+        self._annotations.strokes.pop(frame, None)
+        self._refresh_ann_markers()
+        self._canvas.update()
+
+    def _on_session_clear_all(self) -> None:
+        self._annotations.strokes.clear()
+        self._refresh_ann_markers()
+        self._canvas.update()
+
+    def _on_session_disconnected(self) -> None:
+        self._session_client = None
+        self._session_follower = False
+        self._session_update_label()
 
     def _ann_toggle_visibility(self) -> None:
         """Toggle annotation visibility from the Annotation menu."""
@@ -5249,6 +5403,17 @@ class BlastPlayerWindow(QMainWindow):
         am.addAction("Clear All Annotations").triggered.connect(
             self._player._on_ann_clear_all)
 
+        # Session
+        sm = mb.addMenu("Session")
+        self._host_act  = sm.addAction("Host Session…")
+        self._join_act  = sm.addAction("Join Session…")
+        sm.addSeparator()
+        self._leave_act = sm.addAction("Leave Session")
+        self._leave_act.setEnabled(False)
+        self._host_act.triggered.connect(self._on_host_session)
+        self._join_act.triggered.connect(self._on_join_session)
+        self._leave_act.triggered.connect(self._on_leave_session)
+
         # Tools
         tm = mb.addMenu("Tools")
         tm.addAction("Preferences…")
@@ -5451,6 +5616,106 @@ class BlastPlayerWindow(QMainWindow):
         ann = self._player._annotations
         self._ann_vis_act.setChecked(ann.visible)
         self._ann_pb_act.setChecked(ann.show_in_playback)
+
+    # ------------------------------------------------------------------ #
+    #  Session                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _on_host_session(self) -> None:
+        port = SessionServer.DEFAULT_PORT
+        ip   = SessionServer.local_ip()
+        dlg  = QDialog(self, Qt.Dialog)
+        dlg.setWindowTitle("Host Session")
+        dlg.setModal(True)
+        dlg.setStyleSheet(
+            f"QDialog{{background:#1c1c1c;color:{constants.TEXT_PRI};}}"
+            f"QLabel{{color:{constants.TEXT_PRI};background:transparent;font-size:12px;}}"
+            f"QPushButton{{background:#2a2a2a;color:{constants.TEXT_PRI};"
+            f"border:1px solid #3a3a3a;border-radius:4px;padding:5px 18px;min-width:72px;}}"
+            f"QPushButton:hover{{background:#363636;border-color:#555;}}"
+            f"QPushButton#ok{{background:{constants.ACCENT_HI};"
+            f"border-color:{constants.ACCENT_HI};}}"
+            f"QPushButton#ok:hover{{background:#1a9cf0;}}"
+        )
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(24, 20, 24, 16)
+        root.setSpacing(12)
+        root.addWidget(QLabel("Share this address with others to join:"))
+        addr_lbl = QLabel(f"<b>{ip}:{port}</b>")
+        addr_lbl.setStyleSheet(
+            f"color:{constants.ACCENT_HI};font-size:14px;background:transparent;")
+        addr_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(addr_lbl)
+        row = QHBoxLayout(); row.setSpacing(8); row.addStretch()
+        cancel_btn = QPushButton("Cancel"); cancel_btn.clicked.connect(dlg.reject)
+        start_btn  = QPushButton("Start Hosting"); start_btn.setObjectName("ok")
+        start_btn.setDefault(True)
+        start_btn.clicked.connect(lambda: dlg.done(2))
+        row.addWidget(cancel_btn); row.addWidget(start_btn)
+        root.addLayout(row)
+        if dlg.exec_() != 2:
+            return
+        if self._player.start_hosting(port):
+            self._host_act.setEnabled(False)
+            self._join_act.setEnabled(False)
+            self._leave_act.setEnabled(True)
+        else:
+            QMessageBox.warning(self, "Session", "Could not start server.")
+
+    def _on_join_session(self) -> None:
+        dlg = QDialog(self, Qt.Dialog)
+        dlg.setWindowTitle("Join Session")
+        dlg.setModal(True)
+        dlg.setStyleSheet(
+            f"QDialog{{background:#1c1c1c;color:{constants.TEXT_PRI};}}"
+            f"QLabel{{color:{constants.TEXT_PRI};background:transparent;font-size:12px;}}"
+            f"QLineEdit{{background:#2a2a2a;color:{constants.TEXT_PRI};"
+            f"border:1px solid #3a3a3a;border-radius:3px;padding:4px 6px;font-size:12px;}}"
+            f"QPushButton{{background:#2a2a2a;color:{constants.TEXT_PRI};"
+            f"border:1px solid #3a3a3a;border-radius:4px;padding:5px 18px;min-width:72px;}}"
+            f"QPushButton:hover{{background:#363636;border-color:#555;}}"
+            f"QPushButton#ok{{background:{constants.ACCENT_HI};"
+            f"border-color:{constants.ACCENT_HI};}}"
+            f"QPushButton#ok:hover{{background:#1a9cf0;}}"
+        )
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(24, 20, 24, 16)
+        root.setSpacing(12)
+        root.addWidget(QLabel("Host address  (IP or hostname):"))
+        ip_edit = QLineEdit()
+        ip_edit.setPlaceholderText(f"e.g. 192.168.1.10:{SessionServer.DEFAULT_PORT}")
+        root.addWidget(ip_edit)
+        row = QHBoxLayout(); row.setSpacing(8); row.addStretch()
+        cancel_btn = QPushButton("Cancel"); cancel_btn.clicked.connect(dlg.reject)
+        join_btn   = QPushButton("Join"); join_btn.setObjectName("ok")
+        join_btn.setDefault(True)
+        join_btn.clicked.connect(lambda: dlg.done(2))
+        row.addWidget(cancel_btn); row.addWidget(join_btn)
+        root.addLayout(row)
+        ip_edit.setFocus()
+        if dlg.exec_() != 2:
+            return
+        text = ip_edit.text().strip()
+        if not text:
+            return
+        if ':' in text:
+            host, port_str = text.rsplit(':', 1)
+            try: port = int(port_str)
+            except ValueError: port = SessionServer.DEFAULT_PORT
+        else:
+            host, port = text, SessionServer.DEFAULT_PORT
+        if self._player.start_following(host, port):
+            self._host_act.setEnabled(False)
+            self._join_act.setEnabled(False)
+            self._leave_act.setEnabled(True)
+        else:
+            QMessageBox.warning(self, "Session", f"Could not connect to {host}:{port}.")
+
+    def _on_leave_session(self) -> None:
+        self._player.stop_session()
+        self._host_act.setEnabled(True)
+        self._join_act.setEnabled(True)
+        self._leave_act.setEnabled(False)
 
     def _on_about(self):
         try:
