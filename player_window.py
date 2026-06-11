@@ -48,7 +48,7 @@ from PyQt5.QtWidgets import (
     QFrame, QToolButton, QActionGroup, QComboBox, QShortcut,
     QOpenGLWidget, QListWidget, QListWidgetItem, QMenu, QDockWidget,
     QApplication, QLineEdit, QInputDialog, QProgressBar,
-    QStyledItemDelegate, QAbstractItemView, QStyle, QSizeGrip,
+    QStyledItemDelegate, QAbstractItemView, QStyle, QSizeGrip, QDialog,
 )
 from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, QRect, QRectF, QPointF, QThread, pyqtSignal, QSettings, QObject
 from PyQt5.QtGui import (
@@ -1516,17 +1516,12 @@ void main() {
         if live:
             current_strokes = current_strokes + [live]
 
-        # Collect ghost layers: (strokes, opacity)
+        # Collect ghost layers: all annotated frames except the current one
         ghost_layers: list = []
         if ann.ghost_enabled:
-            for i in range(ann.ghost_before, 0, -1):
-                s = ann.strokes.get(self._ann_frame - i)
-                if s:
-                    ghost_layers.append((list(s), 0.35))
-            for i in range(1, ann.ghost_after + 1):
-                s = ann.strokes.get(self._ann_frame + i)
-                if s:
-                    ghost_layers.append((list(s), 0.35))
+            for frame, strokes in ann.strokes.items():
+                if frame != self._ann_frame and strokes:
+                    ghost_layers.append((list(strokes), 0.35))
 
         if not current_strokes and not ghost_layers:
             return
@@ -2172,20 +2167,19 @@ def _ann_save_dialog(parent, message: str) -> int:
     Dark-themed Save / Discard / Cancel dialog for annotation changes.
     Returns 2 = Save, 1 = Discard, 0 = Cancel.
     """
-    from core import constants as _c
     dlg = QDialog(parent, Qt.Dialog)
     dlg.setWindowTitle("Unsaved Annotations")
     dlg.setModal(True)
     dlg.setStyleSheet(
-        f"QDialog{{background:#1c1c1c;color:{_c.TEXT_PRI};}}"
-        f"QLabel{{color:{_c.TEXT_PRI};background:transparent;"
+        f"QDialog{{background:#1c1c1c;color:{constants.TEXT_PRI};}}"
+        f"QLabel{{color:{constants.TEXT_PRI};background:transparent;"
         f"font-size:13px;padding:0;}}"
-        f"QPushButton{{background:#2a2a2a;color:{_c.TEXT_PRI};"
+        f"QPushButton{{background:#2a2a2a;color:{constants.TEXT_PRI};"
         f"border:1px solid #3a3a3a;border-radius:4px;"
         f"padding:5px 18px;font-size:12px;min-width:72px;}}"
         f"QPushButton:hover{{background:#363636;border-color:#555;}}"
-        f"QPushButton#save_btn{{background:{_c.ACCENT_HI};"
-        f"border-color:{_c.ACCENT_HI};}}"
+        f"QPushButton#save_btn{{background:{constants.ACCENT_HI};"
+        f"border-color:{constants.ACCENT_HI};}}"
         f"QPushButton#save_btn:hover{{background:#1a9cf0;"
         f"border-color:#1a9cf0;}}"
     )
