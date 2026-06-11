@@ -985,13 +985,16 @@ class ScrubberSlider(QSlider):
             x = x_for(self._out_frame)
             painter.drawLine(x, gy - 7, x, gy + 7)
 
-        # Annotation frame markers — vertical ticks on the groove
+        # Annotation frame markers — scaled ticks, capped so adjacent frames stay distinct
         if self._ann_frames:
-            painter.setPen(QPen(QColor("#FFD700"), 2))
+            total_frames = max(1, self.maximum() - self.minimum())
+            frame_px = span / total_frames
+            w = max(1, min(round(frame_px) - 1, 4))  # leave 1px gap; cap at 4px
+            ann_color = QColor("#FFD700")
             for frame in self._ann_frames:
                 if self.minimum() <= frame <= self.maximum():
-                    x = x_for(frame)
-                    painter.drawLine(x, gy - 5, x, gy + 5)
+                    cx = x_for(frame)
+                    painter.fillRect(cx - w // 2, gy - 5, w, 10, ann_color)
 
         painter.end()
 
@@ -1686,7 +1689,8 @@ class AnnotationLayer:
         self.ghost_enabled: bool = False
         self.ghost_before:  int  = 1   # frames to show before current
         self.ghost_after:   int  = 1   # frames to show after current
-        self._path:            str  = ""
+        self._path:         str  = ""
+        self._dirty:        bool = False
 
     def begin_stroke(self, u: float, v: float) -> None:
         t = self._tool_thickness.get(self.active_tool, 5)
@@ -1720,7 +1724,7 @@ class AnnotationLayer:
         if s and s["points"]:
             self.strokes.setdefault(frame, []).append(s)
             self._redo.pop(frame, None)   # new stroke invalidates redo history
-            self._save()
+            self._dirty = True
         self._in_progress = None
 
     def cancel_stroke(self) -> None:
@@ -1735,7 +1739,7 @@ class AnnotationLayer:
             self._redo.setdefault(frame, []).append(strokes.pop())
             if not strokes:
                 self.strokes.pop(frame, None)
-            self._save()
+            self._dirty = True
 
     def redo_stroke(self, frame: int) -> None:
         redo = self._redo.get(frame)
@@ -1743,25 +1747,40 @@ class AnnotationLayer:
             self.strokes.setdefault(frame, []).append(redo.pop())
             if not redo:
                 self._redo.pop(frame, None)
-            self._save()
+            self._dirty = True
 
     def clear_frame(self, frame: int) -> None:
         self.strokes.pop(frame, None)
         self._redo.pop(frame, None)
-        self._save()
+        self._dirty = True
 
     def clear_all(self) -> None:
         self.strokes.clear()
         self._redo.clear()
+        self._dirty = True
+
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    def save(self) -> None:
         self._save()
+        self._dirty = False
+
+    def discard(self) -> None:
+        """Reload from disk, throwing away all in-memory changes."""
+        self.strokes.clear()
+        self._redo.clear()
+        self._in_progress = None
+        if self._path:
+            self._load()
+        self._dirty = False
 
     def set_video_path(self, path: str) -> None:
         self.strokes.clear()
         self._redo.clear()
         self._in_progress = None
         self._path = path
-        if path:
-            self._load()
+        self._dirty = False
 
     def _sidecar(self) -> str:
         return (self._path + ".annotations.json") if self._path else ""
@@ -1871,7 +1890,7 @@ class _AnnotationPanel(QWidget):
         for icon_file, tip, sig in (
             ("undo.png",   "Undo last stroke",  self.undo_req),
             ("redo.png",   "Redo last stroke",  self.redo_req),
-            ("delete.png", "Clear this frame",  self.clear_frame_req),
+            ("cancel.png", "Clear this frame",  self.clear_frame_req),
             ("bin.png",    "Clear all frames",  self.clear_all_req),
         ):
             btn = QPushButton()
@@ -2145,6 +2164,55 @@ class _AnnotationPanel(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ann_save_dialog(parent, message: str) -> int:
+    """
+    Dark-themed Save / Discard / Cancel dialog for annotation changes.
+    Returns 2 = Save, 1 = Discard, 0 = Cancel.
+    """
+    from core import constants as _c
+    dlg = QDialog(parent, Qt.Dialog)
+    dlg.setWindowTitle("Unsaved Annotations")
+    dlg.setModal(True)
+    dlg.setStyleSheet(
+        f"QDialog{{background:#1c1c1c;color:{_c.TEXT_PRI};}}"
+        f"QLabel{{color:{_c.TEXT_PRI};background:transparent;"
+        f"font-size:13px;padding:0;}}"
+        f"QPushButton{{background:#2a2a2a;color:{_c.TEXT_PRI};"
+        f"border:1px solid #3a3a3a;border-radius:4px;"
+        f"padding:5px 18px;font-size:12px;min-width:72px;}}"
+        f"QPushButton:hover{{background:#363636;border-color:#555;}}"
+        f"QPushButton#save_btn{{background:{_c.ACCENT_HI};"
+        f"border-color:{_c.ACCENT_HI};}}"
+        f"QPushButton#save_btn:hover{{background:#1a9cf0;"
+        f"border-color:#1a9cf0;}}"
+    )
+    root = QVBoxLayout(dlg)
+    root.setContentsMargins(24, 20, 24, 16)
+    root.setSpacing(18)
+    lbl = QLabel(message)
+    lbl.setWordWrap(True)
+    root.addWidget(lbl)
+    btn_row = QHBoxLayout()
+    btn_row.setSpacing(8)
+    btn_row.addStretch()
+    cancel_btn  = QPushButton("Cancel")
+    discard_btn = QPushButton("Discard")
+    save_btn    = QPushButton("Save")
+    save_btn.setObjectName("save_btn")
+    save_btn.setDefault(True)
+    for b in (cancel_btn, discard_btn, save_btn):
+        btn_row.addWidget(b)
+    root.addLayout(btn_row)
+    cancel_btn.clicked.connect(lambda: dlg.done(0))
+    discard_btn.clicked.connect(lambda: dlg.done(1))
+    save_btn.clicked.connect(lambda: dlg.done(2))
+    return dlg.exec_()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Player widget
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2308,6 +2376,12 @@ class PlayerWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def load_video(self, path: str) -> bool:
+        if self._annotations.is_dirty():
+            result = _ann_save_dialog(self, "Save annotations for the current clip?")
+            if result == 2:
+                self._annotations.save()
+            elif result == 0:
+                return False
         self._cleanup()
         try:
             info = probe_video(path)
@@ -2337,6 +2411,7 @@ class PlayerWidget(QWidget):
         self._play_btn.setIcon(_icon("play-button-arrowhead.png"))
         self._play_btn.setText("")
         self._annotations.set_video_path(path)
+        self._refresh_ann_markers()
         self._canvas._ann_frame = 0
 
         self._show_frame(0)
@@ -4254,6 +4329,14 @@ class PlayerWidget(QWidget):
     def _refresh_ann_markers(self) -> None:
         self._scrubber.set_annotation_frames(set(self._annotations.strokes.keys()))
 
+    def _on_ann_save(self) -> None:
+        self._annotations.save()
+
+    def _on_ann_load_all(self) -> None:
+        self._annotations.discard()   # reloads from disk
+        self._refresh_ann_markers()
+        self._canvas.update()
+
     def _ann_toggle_visibility(self) -> None:
         """Toggle annotation visibility from the Annotation menu."""
         self._annotations.visible = not self._annotations.visible
@@ -5085,6 +5168,11 @@ class BlastPlayerWindow(QMainWindow):
         self._ann_pb_act.setChecked(True)
         self._ann_pb_act.triggered.connect(self._on_ann_pb_toggled)
         am.addSeparator()
+        am.addAction("Save Annotations").triggered.connect(
+            self._player._on_ann_save)
+        am.addAction("Load All Annotations").triggered.connect(
+            self._player._on_ann_load_all)
+        am.addSeparator()
         am.addAction("Clear Frame Annotations").triggered.connect(
             self._player._on_ann_clear_frame)
         am.addAction("Clear All Annotations").triggered.connect(
@@ -5414,6 +5502,13 @@ class BlastPlayerWindow(QMainWindow):
             self._playlist.add_video(path)
 
     def closeEvent(self, event):
+        if self._player._annotations.is_dirty():
+            result = _ann_save_dialog(self, "Save annotations before closing?")
+            if result == 2:
+                self._player._annotations.save()
+            elif result == 0:
+                event.ignore()
+                return
         self._save_geometry()
         self._save_settings()
         self._player.stop()
