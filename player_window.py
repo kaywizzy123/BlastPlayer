@@ -2024,13 +2024,65 @@ class _AnnotationPanel(QWidget):
         )
 
     def _pick_color(self) -> None:
-        color = QColorDialog.getColor(QColor(self._ann.pen_color), self, "Pen Color")
-        if color.isValid():
-            self._ann.pen_color = color.name()
-            self._refresh_color_btn()
-            # Auto-switch to pen when color changes
-            if self._ann.active_tool not in ("pen", "line", "arrow", "rect", "ellipse"):
-                self._tool_btns["pen"].setChecked(True)
+        dlg = QColorDialog(QColor(self._ann.pen_color), self)
+        dlg.setWindowTitle("Pen Color")
+        dlg.setOptions(QColorDialog.DontUseNativeDialog)
+        dlg.setStyleSheet(f"""
+            QColorDialog, QColorDialog > QWidget {{
+                background: #1c1c1c; color: {constants.TEXT_PRI};
+            }}
+            QLabel {{
+                color: {constants.TEXT_PRI}; background: transparent;
+            }}
+            QPushButton {{
+                background: #2a2a2a; color: {constants.TEXT_PRI};
+                border: 1px solid #3a3a3a; border-radius: 4px;
+                padding: 4px 14px; min-width: 64px;
+            }}
+            QPushButton:hover {{ background: #363636; border-color: #555; }}
+            QLineEdit, QSpinBox {{
+                background: #2a2a2a; color: {constants.TEXT_PRI};
+                border: 1px solid #3a3a3a; border-radius: 3px; padding: 2px 4px;
+            }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                background: #333; border: none; width: 14px;
+            }}
+            QSpinBox::up-arrow {{ border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 5px solid {constants.TEXT_SEC}; }}
+            QSpinBox::down-arrow {{ border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {constants.TEXT_SEC}; }}
+            QAbstractItemView {{
+                background: #1c1c1c; color: {constants.TEXT_PRI};
+                selection-background-color: {constants.ACCENT_HI};
+            }}
+        """)
+        _ok_style = (
+            f"QPushButton{{background:{constants.ACCENT_HI};color:{constants.TEXT_PRI};"
+            f"border:1px solid {constants.ACCENT_HI};border-radius:4px;"
+            f"padding:4px 14px;min-width:64px;}}"
+            f"QPushButton:hover{{background:#1a9cf0;border-color:#1a9cf0;}}"
+        )
+        _cancel_style = (
+            f"QPushButton{{background:#2a2a2a;color:{constants.TEXT_PRI};"
+            f"border:1px solid #3a3a3a;border-radius:4px;"
+            f"padding:4px 14px;min-width:64px;}}"
+            f"QPushButton:hover{{background:#363636;border-color:#555;}}"
+        )
+        for btn in dlg.findChildren(QPushButton):
+            txt = btn.text().replace("&", "")
+            if txt == "OK":
+                btn.setStyleSheet(_ok_style)
+            elif txt == "Cancel":
+                btn.setStyleSheet(_cancel_style)
+        if dlg.exec_() == QDialog.Accepted:
+            color = dlg.selectedColor()
+            if color.isValid():
+                self._ann.pen_color = color.name()
+                self._refresh_color_btn()
+                if self._ann.active_tool not in ("pen", "line", "arrow", "rect", "ellipse"):
+                    self._tool_btns["pen"].setChecked(True)
             self.changed.emit()
 
     # ── Tool toggle ───────────────────────────────────────────────────── #
@@ -4337,6 +4389,15 @@ class PlayerWidget(QWidget):
         else:
             self._annotations.save()
 
+    def _on_ann_unload_all(self) -> None:
+        ann = self._annotations
+        ann.strokes.clear()
+        ann._redo.clear()
+        ann._in_progress = None
+        ann._dirty = False
+        self._refresh_ann_markers()
+        self._canvas.update()
+
     def _on_ann_load_all(self) -> None:
         ann = self._annotations
         ann.strokes.clear()
@@ -5180,6 +5241,8 @@ class BlastPlayerWindow(QMainWindow):
             self._player._on_ann_save)
         am.addAction("Load All Annotations").triggered.connect(
             self._player._on_ann_load_all)
+        am.addAction("Unload All Annotations").triggered.connect(
+            self._player._on_ann_unload_all)
         am.addSeparator()
         am.addAction("Clear Frame Annotations").triggered.connect(
             self._player._on_ann_clear_frame)
