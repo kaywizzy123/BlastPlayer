@@ -4,15 +4,15 @@ BlastPlayer — player_window.py  (v4, FFmpeg backend)
 Layout
 ------
   BlastPlayerWindow
-  â"œ-- menu bar
-  â""-- QStackedWidget
-      â"œ-- WelcomeWidget
-      â""-- PlayerWidget
-          â"œ-- VideoCanvas   (fills all space — pure black, video scaled to fit)
-          â""-- BottomBar     (dark strip)
-              â"œ-- info row  "N frames"  |  FRAME#  |  fps
-              â"œ-- scrubber  (full width)
-              â""-- transport row  [tools]  [nav]  [volume]
+  ├-- menu bar
+  └-- QStackedWidget
+      ├-- WelcomeWidget
+      └-- PlayerWidget
+          ├-- VideoCanvas   (fills all space — pure black, video scaled to fit)
+          └-- BottomBar     (dark strip)
+              ├-- info row  "N frames"  |  FRAME#  |  fps
+              ├-- scrubber  (full width)
+              └-- transport row  [tools]  [nav]  [volume]
 
 FFmpeg backend notes
 --------------------
@@ -210,9 +210,9 @@ def probe_video(path: str) -> dict:
     }
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 #  Playlist sidebar — helpers
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 
 _THUMB_W = 80    # thumbnail width  (px)
 _THUMB_H = 45    # thumbnail height (px, ~16:9)
@@ -368,7 +368,7 @@ class _PlaylistDelegate(QStyledItemDelegate):
             painter.drawText(QRect(lx, r.y() + 27, lw, 14),
                              Qt.AlignLeft | Qt.AlignVCenter, el2)
 
-        # Row 3 — duration Â· frame count Â· fps  (bottom-aligned)
+        # Row 3 — duration · frame count · fps  (bottom-aligned)
         parts: list[str] = []
         if duration > 0:
             parts.append(_fmt_duration(duration))
@@ -376,16 +376,16 @@ class _PlaylistDelegate(QStyledItemDelegate):
             parts.append(f"{frames} fr")
         if fps:
             parts.append(f"{fps:.4g} fps")
-        info = "  Â·  ".join(parts)
+        info = "  ·  ".join(parts)
         painter.drawText(QRect(lx, r.bottom() - 20, lw, 16),
                          Qt.AlignLeft | Qt.AlignVCenter, info)
 
         painter.restore()
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 #  Playlist sidebar
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 
 class PlaylistSidebar(QWidget):
     video_selected           = pyqtSignal(str)
@@ -400,7 +400,7 @@ class PlaylistSidebar(QWidget):
         self._paths:            list = []
         self._active_selection: list = []
         self._current_playing:  str  = ""
-        self._thumb_threads:    dict = {}   # path â†' _ThumbnailLoader
+        self._thumb_threads:    dict = {}   # path → _ThumbnailLoader
 
         self.create_widgets()
         self.create_layout()
@@ -631,7 +631,7 @@ class PlaylistSidebar(QWidget):
         else:
             self._audio_bar.hide()
 
-    # -- Drag-and-drop (OS â†' sidebar) --------------------------------------- #
+    # -- Drag-and-drop (OS → sidebar) --------------------------------------- #
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
@@ -802,9 +802,9 @@ class PlaylistSidebar(QWidget):
             self.add_video(p)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 #  Video canvas
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 
 class VideoCanvas(QOpenGLWidget):
     """
@@ -860,7 +860,7 @@ void main() {
         self._frame_raw  = None   # bytes | None  — current SDR/HDR frame
         self._vid_w      = 0
         self._vid_h      = 0
-        self._is_hdr     = False  # True â†' rgb48le (GL_UNSIGNED_SHORT)
+        self._is_hdr     = False  # True → rgb48le (GL_UNSIGNED_SHORT)
         self._zoom       = 1.0
         self._pan_x      = 0
         self._pan_y      = 0
@@ -874,12 +874,12 @@ void main() {
         self._tex_id     = None   # streaming texture for set_frame()
         self._tex_w      = 0
         self._tex_h      = 0
-        self._pbos       = None   # two PBOs for async CPUâ†'GPU upload (set in initializeGL)
+        self._pbos       = None   # two PBOs for async CPU→GPU upload (set in initializeGL)
         self._pbo_idx    = 0
 
         # GPU texture cache
         self._tex_pool      = []   # list[int] — pre-allocated texture IDs
-        self._tex_cache     = {}   # frame_num â†' tex_pool index
+        self._tex_cache     = {}   # frame_num → tex_pool index
         self._cache_w       = 0
         self._cache_h       = 0
         self._cache_is_hdr  = False
@@ -893,8 +893,8 @@ void main() {
         # Annotation overlay
         self._ann_layer:   "AnnotationLayer | None" = None
         self._ann_frame:   int  = 0
-        self._ann_drawing: bool = False  # True â†' mouse captured for pen/eraser
-        self._ann_playing: bool = False  # True â†' currently in playback
+        self._ann_drawing: bool = False  # True → mouse captured for pen/eraser
+        self._ann_playing: bool = False  # True → currently in playback
 
     # -- Public API ----------------------------------------------------- #
 
@@ -908,7 +908,7 @@ void main() {
         self.update()
 
     def set_cached_frame(self, tex_id: int):
-        """Render a previously cached texture (skips CPUâ†'GPU upload)."""
+        """Render a previously cached texture (skips CPU→GPU upload)."""
         self._draw_tex_id = tex_id
         self.update()
 
@@ -1034,7 +1034,7 @@ void main() {
         self._tex_id = int(glGenTextures(1))
         self._alloc_texture(self._tex_id, 0, 0, False)
 
-        # Two PBOs for async CPUâ†'GPU texture upload (double-buffer orphaning)
+        # Two PBOs for async CPU→GPU texture upload (double-buffer orphaning)
         self._pbos    = glGenBuffers(2)
         self._pbo_idx = 0
 
@@ -1090,7 +1090,7 @@ void main() {
                     if ptr is not None:
                         ctypes.memmove(ptr, self._frame_raw, data_size)
                         glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)
-                        # PBO bound â†' last arg is byte-offset, not a data pointer.
+                        # PBO bound → last arg is byte-offset, not a data pointer.
                         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
                                         GL_RGB, gl_type, ctypes.c_void_p(0))
                     else:
@@ -1120,12 +1120,12 @@ void main() {
 
         self._prog.bind()
 
-        # Frame texture â†' unit 0
+        # Frame texture → unit 0
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, render_tex)
         self._prog.setUniformValue("u_frame", 0)
 
-        # OCIO LUT textures â†' units 1, 2, …
+        # OCIO LUT textures → units 1, 2, …
         if self._ocio_enabled:
             for i, (sampler, tid, is_3d) in enumerate(self._ocio_lut_info):
                 unit = GL_TEXTURE1 + i
@@ -1136,7 +1136,7 @@ void main() {
                 if loc >= 0:
                     glUniform1i(loc, i + 1)
 
-        stride = 4 * 4          # 4 floats Ã— 4 bytes
+        stride = 4 * 4          # 4 floats × 4 bytes
         self._prog.enableAttributeArray(0)
         self._prog.enableAttributeArray(1)
         self._prog.setAttributeBuffer(0, GL_FLOAT, 0,     2, stride)
@@ -1307,7 +1307,7 @@ void main() {
     # -- paintEvent override (annotation overlay) ----------------------- #
 
     def paintEvent(self, event):
-        super().paintEvent(event)   # runs paintGL â†' video on screen
+        super().paintEvent(event)   # runs paintGL → video on screen
         ann = self._ann_layer
         if ann is None or not ann.visible:
             return
@@ -1463,9 +1463,9 @@ void main() {
 
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 #  Player widget
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 
 class PlayerWidget(QWidget):
     """
@@ -1483,11 +1483,11 @@ class PlayerWidget(QWidget):
                       for frame-accurate positioning.
 
     Shortcuts:  Space/K  play-pause   L  play-fwd   J  play-bwd
-                â†/â†'  step frame       Home/End  first/last
+                ←/→  step frame       Home/End  first/last
     """
 
     _SPEEDS             = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
-    _SPEED_LABELS       = ("0.25Ã—", "0.5Ã—", "0.75Ã—", "1Ã—", "1.25Ã—", "1.5Ã—", "1.75Ã—", "2Ã—")
+    _SPEED_LABELS       = ("0.25×", "0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×")
     _CACHE_MAX_MB        = 2048   # skip CPU RAM cache if decoded frames exceed this
     _PREFETCH_QUEUE_SIZE = 64     # frames buffered ahead in the pipe reader thread
     _WINDOW_BUDGET_MB    = 4096   # sliding-window RAM budget for large-video playback
@@ -1549,7 +1549,7 @@ class PlayerWidget(QWidget):
 
         # Sliding window cache (Tier-2: large videos that exceed _CACHE_MAX_MB)
         self._use_window      = False
-        self._wnd: dict       = {}          # frame_number â†' raw_bytes
+        self._wnd: dict       = {}          # frame_number → raw_bytes
         self._wnd_fwd_size    = 0           # frames to keep ahead of playhead
         self._wnd_bwd_size    = 0           # frames to keep behind playhead
         self._wnd_fwd_proc    = None
@@ -1563,7 +1563,7 @@ class PlayerWidget(QWidget):
         self._frame_cache   = None   # list[bytes] once ready, None while not cached
         self._cache_loading = False  # True while background decode is running
         # Per-clip cache for multi-clip mode (keyed by path)
-        self._mc_caches: dict = {}   # path â†' list[bytes]
+        self._mc_caches: dict = {}   # path → list[bytes]
 
         # GPU texture cache — frames uploaded to VideoCanvas texture pool
         self._gpu_cache_ready   = False
@@ -1624,9 +1624,9 @@ class PlayerWidget(QWidget):
         # Session sync
         self._session_server:    SessionServer | None = None
         self._session_client:    SessionClient | None = None
-        self._session_follower:  bool = False   # True â†' we receive, not broadcast
+        self._session_follower:  bool = False   # True → we receive, not broadcast
         self._session_applying:  bool = False   # guard against re-broadcast loops
-        self._session_stream_mode: bool = False  # True â†' no local file; display host frames
+        self._session_stream_mode: bool = False  # True → no local file; display host frames
 
         self.create_widgets()
         self.create_layout()
@@ -1723,7 +1723,7 @@ class PlayerWidget(QWidget):
 
     @staticmethod
     def _exr_seq_pattern(path: str) -> str:
-        """Convert frame_0001.exr â†' frame_%04d.exr for ffmpeg -i."""
+        """Convert frame_0001.exr → frame_%04d.exr for ffmpeg -i."""
         m = re.search(r'(\d+)(\.[^.]+)$', path)
         if m:
             return path[:m.start(1)] + f"%0{len(m.group(1))}d" + m.group(2)
@@ -2763,7 +2763,7 @@ class PlayerWidget(QWidget):
             self._playlist_btn.setIcon(ic)
             self._playlist_btn.setIconSize(QSize(14, 14))
         else:
-            self._playlist_btn.setText("â‰¡")
+            self._playlist_btn.setText("≡")
         self._playlist_btn.setCheckable(True)
         self._playlist_btn.setFixedSize(28, 28)
         self._playlist_btn.setFocusPolicy(Qt.NoFocus)
@@ -2777,7 +2777,7 @@ class PlayerWidget(QWidget):
             self._ann_btn.setIcon(ic_ann)
             self._ann_btn.setIconSize(QSize(14, 14))
         else:
-            self._ann_btn.setText("âœ")
+            self._ann_btn.setText("✏")
         self._ann_btn.setCheckable(True)
         self._ann_btn.setFixedSize(28, 28)
         self._ann_btn.setFocusPolicy(Qt.NoFocus)
@@ -2789,10 +2789,10 @@ class PlayerWidget(QWidget):
         tr.addStretch(1)
 
         self._first_btn = _nav_btn("", "backward.png",              tooltip="First frame  (Home)", w=28, h=28)
-        self._prev_btn  = _nav_btn("", "left-arrow.png",            tooltip="Step back  (â†)",      w=28, h=28)
+        self._prev_btn  = _nav_btn("", "left-arrow.png",            tooltip="Step back  (←)",      w=28, h=28)
         self._back_btn  = _nav_btn("", "left.png",                  tooltip="Play backward  (J)",  w=28, h=28)
         self._play_btn  = _nav_btn("", "play-button-arrowhead.png", tooltip="Play / Pause  (Space)", w=42, h=32)
-        self._next_btn  = _nav_btn("", "right-arrow (2).png",       tooltip="Step forward  (â†')",   w=28, h=28)
+        self._next_btn  = _nav_btn("", "right-arrow (2).png",       tooltip="Step forward  (→)",   w=28, h=28)
         self._last_btn  = _nav_btn("", "skip-button.png",           tooltip="Last frame  (End)",   w=28, h=28)
 
         self._loop_btn = QPushButton()
@@ -3748,12 +3748,12 @@ class PlayerWidget(QWidget):
         if self._session_server:
             n = self._session_server.client_count
             viewers = f"{n} viewer{'s' if n != 1 else ''}"
-            self._session_lbl.setText(f"â— HOSTING  {viewers}")
+            self._session_lbl.setText(f"● HOSTING  {viewers}")
             self._session_lbl.setStyleSheet(
                 "color:#4CAF50;font-size:10px;font-weight:bold;background:transparent;")
             self._session_lbl.setVisible(True)
         elif self._session_client and self._session_follower:
-            self._session_lbl.setText("â— LIVE")
+            self._session_lbl.setText("● LIVE")
             self._session_lbl.setStyleSheet(
                 f"color:{constants.ACCENT_HI};font-size:10px;font-weight:bold;background:transparent;")
             self._session_lbl.setVisible(True)
@@ -4271,11 +4271,11 @@ class PlayerWidget(QWidget):
         """
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 #  Main window
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 #  Playlist dock widget
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 
 class _PlaylistDock(QDockWidget):
     """QDockWidget that corrects the Windows y=0 content-overlap bug and adds
@@ -4368,9 +4368,9 @@ class _PlaylistDock(QDockWidget):
         return super().nativeEvent(event_type, message)
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 #  Custom dock title bar
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 
 class _DockTitleBar(QWidget):
     """Replaces the native QDockWidget title bar with one that matches the UI."""
@@ -4476,7 +4476,7 @@ class _DockTitleBar(QWidget):
         self._float_btn.setToolTip("Dock" if floating else "Float")
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ══════════════════════════════════════════════════════════════════════════════
 
 class BlastPlayerWindow(QMainWindow):
 
@@ -4540,7 +4540,7 @@ class BlastPlayerWindow(QMainWindow):
         self._playlist_dock.setVisible(False)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._playlist_dock)
 
-        # Sync toggle button â†" dock visibility
+        # Sync toggle button ↔ dock visibility
         self._player._playlist_btn.toggled.connect(self._playlist_dock.setVisible)
         self._playlist_dock.visibilityChanged.connect(
             self._player._playlist_btn.setChecked)
@@ -4561,7 +4561,7 @@ class BlastPlayerWindow(QMainWindow):
     def _build_annotation_panel(self):
         ann = self._player._ann_panel
 
-        # Panel signals â†' canvas repaint / player actions / menu sync
+        # Panel signals → canvas repaint / player actions / menu sync
         ann.changed.connect(self._player._canvas.update)
         ann.changed.connect(self._sync_ann_menu_state)
         ann.changed.connect(self._player._refresh_ann_markers)
